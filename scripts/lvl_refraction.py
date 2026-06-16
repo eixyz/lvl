@@ -591,7 +591,8 @@ class AnalysisWorkflow:
                  shots_info: list, shot_label_pos: dict,
                  all_picks: dict, recv_positions: Any,
                  perp_override: dict | None = None,
-                 enable_layer_pick: bool = True):
+                 enable_layer_pick: bool = True,
+                 existing_layer_results: dict | None = None):
         self.profile_name = profile_name
         self.cfg = cfg
         self.shots_info = shots_info
@@ -600,6 +601,7 @@ class AnalysisWorkflow:
         self.recv_positions = recv_positions
         self.perp_override = perp_override or {}
         self.enable_layer_pick = bool(enable_layer_pick)
+        self.existing_layer_results = existing_layer_results or {}
 
         self.perp_by_shot: dict = {}
         self.corrected_by_shot: dict = {}
@@ -623,10 +625,11 @@ class AnalysisWorkflow:
 
         if self.enable_layer_pick:
             self.layer_results = pick_layer_windows_interactive(
-                self.profile_name, self.corrected_by_shot
+                self.profile_name, self.corrected_by_shot,
+                existing_results=self.existing_layer_results,
             )
         else:
-            self.layer_results = {}
+            self.layer_results = self.existing_layer_results
 
         return {
             "perp_by_shot": self.perp_by_shot,
@@ -953,6 +956,8 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         )
 
     def _finish(skip: bool):
+        if state["done"]:
+            return
         state["skip"] = skip
         state["done"] = True
         try:
@@ -1131,11 +1136,13 @@ def _fit_layers_from_windows(x_vals: Any, t_vals: Any, windows: list) -> dict:
 
 
 def pick_layer_windows_interactive(profile_name: str,
-                                   corrected_by_shot: dict) -> dict:
+                                   corrected_by_shot: dict,
+                                   existing_results: dict | None = None) -> dict:
     """
     Interactive layer picking for each shot side (L/R).
     Returns {shot_id: {"L": fit_result, "R": fit_result}}.
     """
+    existing = existing_results or {}
     results: dict = {}
     print("\n  -- Layer windows picking (x1..x6) --")
     print("     For each shot side: pick x1,x2,x3,x4,x5,x6; Enter to skip side.")
@@ -1175,12 +1182,24 @@ def pick_layer_windows_interactive(profile_name: str,
             windows = pick_payload.get("windows", [None, None, None])
             picked_points = pick_payload.get("picked_points", [])
             if all(w is None for w in windows):
-                print(f"     Shot {shot_id} Side {side}: skipped by user.")
+                prev = ((existing.get(int(shot_id), {}) or {}).get(side))
+                if prev:
+                    per_side[side] = prev
+                    print(f"     Shot {shot_id} Side {side}: skipped by user, kept previous layer picks.")
+                else:
+                    fit_res = _fit_layers_from_windows(x, t, windows)
+                    fit_res["windows"] = windows
+                    fit_res["picked_points"] = picked_points
+                    fit_res["n_points"] = int(len(x))
+                    fit_res["skipped"] = True
+                    per_side[side] = fit_res
+                    print(f"     Shot {shot_id} Side {side}: skipped by user, saved empty layer selection.")
                 continue
             fit_res = _fit_layers_from_windows(x, t, windows)
             fit_res["windows"] = windows
             fit_res["picked_points"] = picked_points
             fit_res["n_points"] = int(len(x))
+            fit_res["skipped"] = False
             per_side[side] = fit_res
 
         if per_side:
@@ -1256,6 +1275,220 @@ def compute_layer_averages(layer_results: dict, shot_pos_by_id: dict) -> dict:
     h2 = depth_3layer(ti2, V0, V1, V2, h1) if (h1 and V2 > 0 and ti2 > 0) else None
     out["h1_m"] = float(h1) if h1 else 0.0
     out["h2_m"] = float(h2) if h2 else 0.0
+    return out
+
+
+def _predict_time_from_fit(x_abs: float, fit_res: dict) -> float | None:
+    """Predict t(ms) at absolute inline offset x_abs from fitted layer windows."""
+    windows = list((fit_res or {}).get("windows", []) or [])
+    windows += [None] * (3 - len(windows))
+    segs = list((fit_res or {}).get("segments", []) or [])
+    segs += [{}] * (3 - len(segs))
+
+    x = float(x_abs)
+    for i in range(3):
+        w = windows[i]
+        seg = segs[i]
+        if w is None:
+            continue
+        x0, x1 = float(w[0]), float(w[1])
+        if not (x0 <= x <= x1):
+            continue
+        sl = float(seg.get("slope_ms_m", 0.0))
+        ic = float(seg.get("intercept_ms", 0.0))
+        if sl <= 0.0:
+            return None
+        return float(sl * x + ic)
+
+    return None
+
+
+def _choose_shot_fit(layer_by_side: dict) -> tuple[str | None, dict | None]:
+    """Choose one representative fit per shot for summary export."""
+    if not layer_by_side:
+        return None, None
+    if "ALL" in layer_by_side:
+        return "ALL", layer_by_side.get("ALL")
+
+    best_side = None
+    best_res = None
+    best_n = -1
+    for side, res in layer_by_side.items():
+        n = int((res or {}).get("n_points", 0))
+        if n > best_n:
+            best_n = n
+            best_side = side
+            best_res = res
+    return best_side, best_res
+
+
+def build_analysis_from_layers(corrected_by_shot: dict,
+                               layer_results: dict) -> dict:
+    """
+    Build per-shot analysis payload for Excel/T-X export.
+
+    Output shape per shot:
+      {
+        "segments": [...],
+        "depths": {...},
+        "rms_ms": float,
+        "n_fit": int,
+        "fit_side": "L"|"R"|"ALL"
+      }
+    """
+    out: dict = {}
+    for shot_id, rows in (corrected_by_shot or {}).items():
+        sides = (layer_results or {}).get(shot_id, {}) or {}
+        fit_side, fit_res = _choose_shot_fit(sides)
+        if not fit_res:
+            continue
+
+        if fit_side == "ALL":
+            rows_fit = list(rows)
+        else:
+            rows_fit = [r for r in rows if r.get("side") == fit_side]
+            if not rows_fit:
+                rows_fit = list(rows)
+
+        obs: list = []
+        pred: list = []
+        for r in rows_fit:
+            x_abs = float(r.get("inline_abs_m", 0.0))
+            t_obs = float(r.get("fb_interp_inline_ms", 0.0))
+            t_pred = _predict_time_from_fit(x_abs, fit_res)
+            if t_pred is None:
+                continue
+            obs.append(t_obs)
+            pred.append(float(t_pred))
+
+        if obs:
+            oa = np.asarray(obs, dtype=float)
+            pa = np.asarray(pred, dtype=float)
+            rms = float(np.sqrt(np.mean((oa - pa) ** 2)))
+        else:
+            rms = 0.0
+
+        segs_raw = list((fit_res or {}).get("segments", []) or [])
+        segs: list = []
+        for i, seg in enumerate(segs_raw):
+            s = dict(seg)
+            w = None
+            wins = list((fit_res or {}).get("windows", []) or [])
+            if i < len(wins):
+                w = wins[i]
+            if w is not None:
+                s["x_start"] = float(w[0])
+                s["x_end"] = float(w[1])
+            else:
+                s["x_start"] = float(seg.get("x0", 0.0))
+                s["x_end"] = float(seg.get("x1", 0.0))
+            segs.append(s)
+
+        out[int(shot_id)] = {
+            "segments": segs,
+            "depths": {
+                "ti1_ms": float((fit_res or {}).get("ti1_ms", 0.0)),
+                "ti2_ms": float((fit_res or {}).get("ti2_ms", 0.0)),
+                "h1_m": float((fit_res or {}).get("h1_m", 0.0)),
+                "h2_m": float((fit_res or {}).get("h2_m", 0.0)),
+            },
+            "rms_ms": rms,
+            "n_fit": int(len(obs)),
+            "fit_side": fit_side or "",
+        }
+
+    return out
+
+
+def export_fit_plot(profile_name: str,
+                    corrected_by_shot: dict,
+                    layer_results: dict,
+                    filename_suffix: str = "") -> Path:
+    """Save observed-vs-computed fit scatter with global RMS annotation."""
+    c = _tc()
+    fig, ax = plt.subplots(figsize=(8.2, 6.2))
+    fig.patch.set_facecolor(c["fig_bg"])
+    ax.set_facecolor(c["ax_bg"])
+
+    pal = ["#e63946", "#2a9d8f", "#e9c46a", "#457b9d", "#f4a261", "#8d99ae"]
+    all_obs: list = []
+    all_pred: list = []
+
+    for i, shot_id in enumerate(sorted(corrected_by_shot)):
+        rows = corrected_by_shot.get(shot_id, [])
+        side_map = (layer_results or {}).get(shot_id, {}) or {}
+        fit_side, fit_res = _choose_shot_fit(side_map)
+        if not rows or not fit_res:
+            continue
+
+        if fit_side == "ALL":
+            rows_fit = rows
+        else:
+            rows_fit = [r for r in rows if r.get("side") == fit_side]
+            if not rows_fit:
+                rows_fit = rows
+
+        obs: list = []
+        pred: list = []
+        for r in rows_fit:
+            t_obs = float(r.get("fb_interp_inline_ms", 0.0))
+            t_pred = _predict_time_from_fit(float(r.get("inline_abs_m", 0.0)), fit_res)
+            if t_pred is None:
+                continue
+            obs.append(t_obs)
+            pred.append(float(t_pred))
+
+        if not obs:
+            continue
+
+        oa = np.asarray(obs, dtype=float)
+        pa = np.asarray(pred, dtype=float)
+        shot_rms = float(np.sqrt(np.mean((oa - pa) ** 2)))
+        col = pal[i % len(pal)]
+        ax.scatter(oa, pa, s=26, color=col, alpha=0.86,
+                   label=f"Shot {shot_id} ({fit_side}) RMS={shot_rms:.2f} ms")
+        all_obs.extend(obs)
+        all_pred.extend(pred)
+
+    if all_obs:
+        obs_a = np.asarray(all_obs, dtype=float)
+        pred_a = np.asarray(all_pred, dtype=float)
+        rms_all = float(np.sqrt(np.mean((obs_a - pred_a) ** 2)))
+        lo = float(min(obs_a.min(), pred_a.min()))
+        hi = float(max(obs_a.max(), pred_a.max()))
+        pad = max(1.0, 0.03 * (hi - lo))
+        lo -= pad
+        hi += pad
+        ax.plot([lo, hi], [lo, hi], "--", color="#444444", lw=1.2, label="Ideal: y=x")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.text(0.02, 0.98, f"Global RMS = {rms_all:.3f} ms\nN = {len(obs_a)}",
+                transform=ax.transAxes, va="top", ha="left",
+                fontsize=9, color=c["text"])
+    else:
+        ax.text(0.5, 0.5, "No fitted points available", transform=ax.transAxes,
+                ha="center", va="center", color=c["text"])
+
+    ax.set_xlabel("Observed FB time (ms)", color=c["label"])
+    ax.set_ylabel("Computed FB time (ms)", color=c["label"])
+    ax.set_title(f"Observed vs Computed Fit - Profile {profile_name}",
+                 color=c["text"], fontsize=11)
+    ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+    ax.tick_params(colors=c["tick"])
+    for sp in ax.spines.values():
+        sp.set_edgecolor(c["spine"])
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
+                  labelcolor=c["text"], loc="best")
+    fig.tight_layout()
+
+    out_dir = OUTPUT_DIR / profile_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{profile_name}_fit_rms{filename_suffix}.png"
+    fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Fit plot  -> {out.relative_to(CWD.parent)}")
     return out
 
 
@@ -2297,6 +2530,80 @@ def _session_picks_json_path(profile_name: str) -> Path:
     return OUTPUT_DIR / profile_name / "picks.session.json"
 
 
+def _layer_json_path(profile_name: str) -> Path:
+    return OUTPUT_DIR / profile_name / "layer_analysis.json"
+
+
+def _layer_session_json_path(profile_name: str) -> Path:
+    return OUTPUT_DIR / profile_name / "layer_analysis.session.json"
+
+
+def _coerce_layer_results(raw: dict) -> dict:
+    out: dict = {}
+    for sid, side_map in (raw or {}).items():
+        try:
+            shot_id = int(sid)
+        except Exception:
+            continue
+        if not isinstance(side_map, dict):
+            continue
+        out[shot_id] = {str(side): dict(payload) for side, payload in side_map.items()
+                        if isinstance(payload, dict)}
+    return out
+
+
+def load_layer_json(profile_name: str) -> dict:
+    p = _layer_json_path(profile_name)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return _coerce_layer_results(raw)
+    except Exception as exc:
+        print(f"  [WARN] Could not load layer_analysis.json: {exc}")
+        return {}
+
+
+def load_layer_session_json(profile_name: str) -> dict:
+    p = _layer_session_json_path(profile_name)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return _coerce_layer_results(raw)
+    except Exception as exc:
+        print(f"  [WARN] Could not load layer_analysis.session.json: {exc}")
+        return {}
+
+
+def save_layer_json(profile_name: str, layer_results: dict):
+    p = _layer_json_path(profile_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({str(k): v for k, v in (layer_results or {}).items()}, fh, indent=2)
+    print(f"     Layer analysis saved -> {p.relative_to(CWD.parent)}")
+
+
+def save_layer_session_json(profile_name: str, layer_results: dict):
+    p = _layer_session_json_path(profile_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({str(k): v for k, v in (layer_results or {}).items()}, fh, indent=2)
+    print(f"     Layer session saved -> {p.relative_to(CWD.parent)}")
+
+
+def clear_layer_session_json(profile_name: str):
+    p = _layer_session_json_path(profile_name)
+    try:
+        if p.exists():
+            p.unlink()
+            print(f"     Layer session file cleared -> {p.relative_to(CWD.parent)}")
+    except Exception as exc:
+        print(f"  [WARN] Could not clear layer session file: {exc}")
+
+
 def load_picks_json(profile_name: str) -> dict:
     """Load raw picks: {shot_id: {trace_idx: ms}}."""
     p = _picks_json_path(profile_name)
@@ -2816,8 +3123,8 @@ def export_tx_plot(profile_name: str, shots_info: list,
             for seg in res["segments"]:
                 # Convert segment x-range (absolute offset) back to geometry x
                 # using shot position so lines align with geometry x-axis
-                xg0 = shot_pos_m + seg["x_start"]
-                xg1 = shot_pos_m + seg["x_end"]
+                xg0 = shot_pos_m + float(seg.get("x_start", seg.get("x0", 0.0)))
+                xg1 = shot_pos_m + float(seg.get("x_end", seg.get("x1", 0.0)))
                 sl  = seg["slope_ms_m"]
                 ic  = seg["intercept_ms"]
                 vel = seg["velocity_m_s"]
@@ -3063,6 +3370,12 @@ def process_profile(profile_name: str, pick_mode: bool = True,
 
     analysis: dict = {}
 
+    layer_final: dict = load_layer_json(profile_name)
+    layer_session: dict = load_layer_session_json(profile_name)
+    existing_layer_results: dict = layer_session if layer_session else layer_final
+    if layer_session:
+        print("  Layer session found: resuming from layer_analysis.session.json")
+
     # Exports / correction UI
     print(f"\n  -- Exporting / correction  ({total_picks} picks) --")
     shots_info_proc = [(sid, sp_proc) for sid, sp_proc, _ in shots_meta]
@@ -3076,11 +3389,14 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         recv_positions=recv_positions,
         perp_override=perp_by_shot_override,
         enable_layer_pick=enable_layer_pick,
+        existing_layer_results=existing_layer_results,
     )
     analysis_bundle = analysis_ui.run()
     perp_by_shot = analysis_bundle["perp_by_shot"]
     corrected_by_shot = analysis_bundle["corrected_by_shot"]
     layer_results = analysis_bundle["layer_results"]
+    analysis = build_analysis_from_layers(corrected_by_shot, layer_results)
+    save_layer_session_json(profile_name, layer_results)
 
     qc_suffix = "_preview" if preview_only else ""
     export_corrected_qc_plot(profile_name, corrected_by_shot,
@@ -3096,6 +3412,10 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                      layer_results=layer_results,
                      perp_by_shot=perp_by_shot,
                      filename_suffix="_preview")
+        export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
+                       analysis, perp_m=perp_m, shot_label_pos=shot_label_pos)
+        export_fit_plot(profile_name, corrected_by_shot, layer_results,
+                        filename_suffix="_preview")
         print("  Preview files written; final picks.json not updated.")
         return
 
@@ -3107,8 +3427,11 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                  perp_by_shot=perp_by_shot)
     export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
                    analysis, perp_m=perp_m, shot_label_pos=shot_label_pos)
+    export_fit_plot(profile_name, corrected_by_shot, layer_results)
     save_picks_json(profile_name, all_picks)
+    save_layer_json(profile_name, layer_results)
     clear_session_picks_json(profile_name)
+    clear_layer_session_json(profile_name)
     print(f"\n  Output -> {(OUTPUT_DIR / profile_name).relative_to(CWD.parent)}")
 
 
