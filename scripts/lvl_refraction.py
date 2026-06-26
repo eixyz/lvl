@@ -93,11 +93,13 @@ pd = _ensure("pandas")
 _ensure("obspy")
 _ensure("matplotlib")
 _ensure("openpyxl")
+_ensure("scipy")
 
 from obspy import read as _read_obspy          # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, Slider, TextBox
+from scipy.signal import butter as _scipy_butter, sosfiltfilt as _scipy_sosfiltfilt
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
@@ -157,6 +159,8 @@ BP_F3: float = 140.0  # Hz
 BP_F4: float = 180.0  # Hz
 BP_FFT_PAD: float = 0.25   # 25 % zero-padding (ProMAX default)
 BP_REAPPLY: bool  = False  # True = apply twice (squares amplitude response)
+BUTTER_ORDER: int = 4      # Butterworth order (zero-phase via sosfiltfilt)
+FILTER_DEBOUNCE_MS: int = 40  # 0 = immediate live update, >0 = debounce while dragging
 
 # ---------------------------------------------------------------------------
 # Bulk time static  (ProMAX: "Bulk shift static -> Add")
@@ -768,6 +772,39 @@ def apply_ormsby_all_params(data: Any, dt_s: float,
     out = np.empty_like(data)
     for i in range(data.shape[0]):
         out[i] = ormsby(data[i], dt_s, f1=f1, f2=f2, f3=f3, f4=f4)
+    return out
+
+
+def butterworth_bandpass(trace: Any, dt_s: float,
+                         low_hz: float, high_hz: float,
+                         order: int = BUTTER_ORDER) -> Any:
+    """Zero-phase Butterworth bandpass using scipy SOS filter."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size < 8:
+        return x.astype(np.float32)
+
+    fs = 1.0 / max(float(dt_s), 1e-12)
+    nyq = 0.5 * fs
+    lo = max(0.001, float(low_hz))
+    hi = min(float(high_hz), nyq * 0.999)
+    if not (0.0 < lo < hi < nyq):
+        return x.astype(np.float32)
+
+    sos = _scipy_butter(int(max(1, order)), [lo, hi], btype="bandpass", fs=fs, output="sos")
+    try:
+        y = _scipy_sosfiltfilt(sos, x)
+    except Exception:
+        y = x
+    return np.asarray(y, dtype=np.float32)
+
+
+def apply_butterworth_all_params(data: Any, dt_s: float,
+                                 low_hz: float, high_hz: float,
+                                 order: int = BUTTER_ORDER) -> Any:
+    """Apply Butterworth bandpass to every trace in data."""
+    out = np.empty_like(data)
+    for i in range(data.shape[0]):
+        out[i] = butterworth_bandpass(data[i], dt_s, low_hz=low_hz, high_hz=high_hz, order=order)
     return out
 
 
@@ -1523,12 +1560,11 @@ def export_corrected_qc_plot(profile_name: str,
         ax1.plot(tr, t_interp, "o-", ms=3, lw=1.0, color=col,
                  label=f"Shot {shot_id} (@{label_pos:.1f} m)")
 
-        x_true = [r["true_off_m"] for r in rows]
         ax2.plot(x_geom, t_interp, "o-", ms=3, lw=1.0, color=col, alpha=0.9)
 
-        ax3.plot(tr, x_true, "o-", ms=3, lw=1.0, color=col, alpha=0.9,
-             label=f"Shot {shot_id}")
-        ax3_top.plot(x_geom, x_true, "--", lw=0.9, color=col, alpha=0.7)
+        ax3.plot(tr, t_interp, "o-", ms=3, lw=1.0, color=col, alpha=0.9,
+                 label=f"Shot {shot_id}")
+        ax3_top.plot(x_geom, t_interp, "--", lw=0.9, color=col, alpha=0.7)
 
     # Secondary top axis on geometry-x panel: channels
     sample_rows: list = []
@@ -1565,8 +1601,8 @@ def export_corrected_qc_plot(profile_name: str,
 
     ax3.set_xlabel("Channel", color=c["label"])
     ax3_top.set_xlabel("Geometry x (m)", color=c["label"], fontsize=8)
-    ax3.set_ylabel("True offset Ck (m)", color=c["label"])
-    ax3.set_title("True offset vs channel / geometry", color=c["text"], fontsize=10)
+    ax3.set_ylabel("First-break time (ms)", color=c["label"])
+    ax3.set_title("Interpolated FB vs channel / geometry", color=c["text"], fontsize=10)
 
     for ax in (ax1, ax2, ax3):
         ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
@@ -1581,6 +1617,8 @@ def export_corrected_qc_plot(profile_name: str,
     ax1.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
                labelcolor=c["text"])
     ax1.set_ylim(T_MAX_MS, 0.0)
+    ax2.set_ylim(T_MAX_MS, 0.0)
+    ax3.set_ylim(T_MAX_MS, 0.0)
 
     if layer_results:
         txt_lines: list = []
@@ -1666,7 +1704,7 @@ class FirstBreakPicker:
         self._saved          = False
         self._cancelled      = False
         self._done           = False
-        self._filter_on      = FILTER_ON
+        self._filter_mode    = "ormsby" if FILTER_ON else "none"  # none|ormsby|butter
         self._inverted       = True
         self._top_mode       = "channel"   # "channel" or "offset" (toggle with 'c')
         self.ax_top: Any     = None
@@ -1688,6 +1726,16 @@ class FirstBreakPicker:
         self._f2 = BP_F2
         self._f3 = BP_F3
         self._f4 = BP_F4
+        self._butter_order = BUTTER_ORDER
+        self._filter_debounce_ms = max(0, int(FILTER_DEBOUNCE_MS))
+        self._filter_timer: Any = None
+
+        self.data_ormsby = self.data_filt
+        self.data_butter = apply_butterworth_all_params(
+            self.data_raw, self.dt_s,
+            low_hz=self._f2, high_hz=self._f3,
+            order=self._butter_order,
+        )
 
         if existing_picks:
             self._picks = {int(k): float(v) for k, v in existing_picks.items()}
@@ -1754,8 +1802,6 @@ class FirstBreakPicker:
         self.ax_btn_inv  = self.fig.add_axes([x0 + 1 * (row3_w + gap), 0.84, row3_w, row_h])
         self.ax_btn_tl   = self.fig.add_axes([x0 + 2 * (row3_w + gap), 0.84, row3_w, row_h])
 
-        self.ax_btn_apply= self.fig.add_axes([x0 + 0.145, 0.505, 0.04, 0.022])
-
         btn_face = c["ax_bg"]
         btn_hover = "#e8e8e8" if THEME == "light" else "#2a2d3d"
 
@@ -1765,10 +1811,8 @@ class FirstBreakPicker:
         self.btn_auto = Button(self.ax_btn_auto, "Auto Picker", color=btn_face, hovercolor=btn_hover)
         self.btn_inv  = Button(self.ax_btn_inv, "", color=btn_face, hovercolor=btn_hover)
         self.btn_tl   = Button(self.ax_btn_tl, "Timeline", color=btn_face, hovercolor=btn_hover)
-        self.btn_apply= Button(self.ax_btn_apply, "Apply", color=btn_face, hovercolor=btn_hover)
-
         for btn in (self.btn_prev, self.btn_save, self.btn_next,
-                    self.btn_auto, self.btn_inv, self.btn_tl, self.btn_apply):
+                    self.btn_auto, self.btn_inv, self.btn_tl):
             btn.label.set_color(c["text"])
             btn.label.set_fontsize(8)
             for sp in btn.ax.spines.values():
@@ -1783,7 +1827,6 @@ class FirstBreakPicker:
         self.btn_auto.on_clicked(lambda _e: self._auto_then_redraw())
         self.btn_inv.on_clicked(lambda _e: self._toggle_invert())
         self.btn_tl.on_clicked(lambda _e: self._toggle_timelines())
-        self.btn_apply.on_clicked(lambda _e: self._apply_filter_controls())
 
         label_fs = 8
         value_fs = 8
@@ -1792,9 +1835,11 @@ class FirstBreakPicker:
         self.fig.text(x0, 0.76, "AGC stat:", fontsize=label_fs, fontweight="bold",
                   color=c["text"], ha="left", va="bottom")
         self.fig.text(x0, 0.72, "Display:", fontsize=label_fs, fontweight="bold",
-                  color=c["text"], ha="left", va="bottom")
-        self.fig.text(x0, 0.602, "Filter (Hz)", fontsize=label_fs, fontweight="bold",
-                  color=c["text"], ha="left", va="bottom")
+              color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.620, "Filter mode:", fontsize=label_fs, fontweight="bold",
+              color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.580, "Butter order:", fontsize=label_fs, fontweight="bold",
+              color=c["text"], ha="left", va="bottom")
 
         self._gain_labels = ("none", "norm", "agc")
         self._gain_btns = self._make_mode_buttons(
@@ -1814,28 +1859,40 @@ class FirstBreakPicker:
             labels=self._disp_labels, callback=self._on_display_mode,
         )
 
-        self.ax_agc = self.fig.add_axes([x0+0.025, 0.67, 0.5*w, 0.016], facecolor=c["ax_bg"])
-        self.sl_agc = Slider(self.ax_agc, "AGC", 5.0, 500.0,
+        self._filt_labels = ("none", "butter", "ormsby")
+        self._filt_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.620, w=0.145, h=0.026,
+            labels=self._filt_labels, callback=self._on_filter_mode,
+        )
+
+        self._butter_order_labels = ("2", "4", "6")
+        self._butter_order_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.580, w=0.095, h=0.026,
+            labels=self._butter_order_labels, callback=self._on_butter_order,
+        )
+
+        self.ax_agc = self.fig.add_axes([x0+0.02, 0.67, 0.25*w, 0.016], facecolor=c["ax_bg"])
+        self.sl_agc = Slider(self.ax_agc, "AGC ", 5.0, 500.0,
                              valinit=float(self._agc_window_ms), valstep=1.0)
         self.sl_agc.label.set_fontweight("bold")
         self.sl_agc.label.set_fontsize(8)
         self.sl_agc.valtext.set_fontsize(8)
         self.sl_agc.on_changed(self._on_agc_window)
 
-        self.ax_wig = self.fig.add_axes([x0+0.025, 0.64, 0.5*w, 0.016], facecolor=c["ax_bg"])
-        self.sl_wig = Slider(self.ax_wig, "Scale", 0.20, 5.00,
+        self.ax_wig = self.fig.add_axes([x0+0.125, 0.67, 0.25*w, 0.016], facecolor=c["ax_bg"])
+        self.sl_wig = Slider(self.ax_wig, "Scale ", 0.20, 5.00,
                      valinit=float(self._wiggle_stretch), valstep=0.01)
         self.sl_wig.label.set_fontweight("bold")
         self.sl_wig.label.set_fontsize(8)
         self.sl_wig.valtext.set_fontsize(8)
         self.sl_wig.on_changed(self._on_wiggle_stretch)
 
-        self.fig.text(x0, 0.472, "Time View (ms)", fontsize=8, fontweight="bold",
+        self.fig.text(x0, 0.485, "Time View (ms)", fontsize=8, fontweight="bold",
                   color=c["text"], ha="left", va="bottom")
         tmin_hi = max(self._t_full_start + 1.0, self._t_full_end - 1.0)
         tmax_lo = min(self._t_full_end - 1.0, self._t_full_start + 1.0)
-        self.ax_tmin = self.fig.add_axes([x0 + 0.025, 0.440, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_tmax = self.fig.add_axes([x0 + 0.025, 0.415, 0.1, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmin = self.fig.add_axes([x0 + 0.02, 0.455, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmax = self.fig.add_axes([x0 + 0.125, 0.455, 0.25*w, 0.014], facecolor=c["ax_bg"])
         self.sl_tmin = Slider(self.ax_tmin, "T min", self._t_full_start, tmin_hi,
                       valinit=float(self._t_view_start), valstep=1.0)
         self.sl_tmax = Slider(self.ax_tmax, "T max", tmax_lo, self._t_full_end,
@@ -1849,18 +1906,22 @@ class FirstBreakPicker:
         self.sl_tmin.on_changed(self._on_tmin)
         self.sl_tmax.on_changed(self._on_tmax)
 
-        self.ax_f1 = self.fig.add_axes([x0+0.0125, 0.580, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f2 = self.fig.add_axes([x0+0.0125, 0.555, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f3 = self.fig.add_axes([x0+0.0125, 0.530, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f4 = self.fig.add_axes([x0+0.0125, 0.505, 0.1, 0.014], facecolor=c["ax_bg"])
+        self.ax_f1 = self.fig.add_axes([x0+0.0125, 0.550, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f2 = self.fig.add_axes([x0+0.125, 0.550, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f3 = self.fig.add_axes([x0+0.0125, 0.525, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f4 = self.fig.add_axes([x0+0.125, 0.525, 0.25*w, 0.014], facecolor=c["ax_bg"])
 
-        self.sl_f1 = Slider(self.ax_f1, "f1", 0.0, 50.0, valinit=float(self._f1), valstep=0.5)
-        self.sl_f2 = Slider(self.ax_f2, "f2", 0.5, 80.0, valinit=float(self._f2), valstep=0.5)
-        self.sl_f3 = Slider(self.ax_f3, "f3", 20.0, 220.0, valinit=float(self._f3), valstep=1.0)
-        self.sl_f4 = Slider(self.ax_f4, "f4", 40.0, 260.0, valinit=float(self._f4), valstep=1.0)
+        self.sl_f1 = Slider(self.ax_f1, "f1 ", 0.0, 50.0, valinit=float(self._f1), valstep=0.5)
+        self.sl_f2 = Slider(self.ax_f2, "f2 ", 0.5, 80.0, valinit=float(self._f2), valstep=0.5)
+        self.sl_f3 = Slider(self.ax_f3, "f3 ", 20.0, 220.0, valinit=float(self._f3), valstep=1.0)
+        self.sl_f4 = Slider(self.ax_f4, "f4 ", 40.0, 260.0, valinit=float(self._f4), valstep=1.0)
+        self.sl_f1.on_changed(self._on_filter_sliders)
+        self.sl_f2.on_changed(self._on_filter_sliders)
+        self.sl_f3.on_changed(self._on_filter_sliders)
+        self.sl_f4.on_changed(self._on_filter_sliders)
 
         # Header/parameter info panel
-        self.ax_info = self.fig.add_axes([x0, 0.125, w, 0.265], facecolor=c["ax_bg"])
+        self.ax_info = self.fig.add_axes([x0, 0.125, w, 0.23], facecolor=c["ax_bg"])
         self.ax_info.set_xticks([])
         self.ax_info.set_yticks([])
         for sp in self.ax_info.spines.values():
@@ -1908,6 +1969,14 @@ class FirstBreakPicker:
             self._style_mode_buttons(self._stat_btns, self._stat_labels, self._agc_stat)
         if hasattr(self, "_disp_btns"):
             self._style_mode_buttons(self._disp_btns, self._disp_labels, self._display_mode)
+        if hasattr(self, "_filt_btns"):
+            self._style_mode_buttons(self._filt_btns, self._filt_labels, self._filter_mode)
+        if hasattr(self, "_butter_order_btns"):
+            self._style_mode_buttons(
+                self._butter_order_btns,
+                self._butter_order_labels,
+                str(int(self._butter_order)),
+            )
 
     def _refresh_toggle_buttons(self):
         c = _tc()
@@ -1973,6 +2042,43 @@ class FirstBreakPicker:
         self._refresh_mode_buttons()
         self._redraw()
 
+    def _on_filter_mode(self, label: str):
+        self._filter_mode = str(label).lower()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _on_butter_order(self, label: str):
+        try:
+            order = int(str(label).strip())
+        except Exception:
+            return
+        if order < 1 or order == int(self._butter_order):
+            return
+        self._butter_order = int(order)
+        self._schedule_filter_update()
+        self._refresh_mode_buttons()
+
+    def _schedule_filter_update(self):
+        if self._filter_debounce_ms <= 0:
+            self._apply_filter_update_now()
+            return
+
+        # Recreate timer each time to debounce rapid slider events.
+        try:
+            if self._filter_timer is not None:
+                self._filter_timer.stop()
+        except Exception:
+            pass
+
+        self._filter_timer = self.fig.canvas.new_timer(interval=int(self._filter_debounce_ms))
+        self._filter_timer.single_shot = True
+        self._filter_timer.add_callback(self._apply_filter_update_now)
+        self._filter_timer.start()
+
+    def _apply_filter_update_now(self):
+        self._recompute_filter()
+        self._redraw()
+
     def _toggle_invert(self):
         self._inverted = not self._inverted
         self._update_invert_button_label()
@@ -1983,29 +2089,38 @@ class FirstBreakPicker:
         self._refresh_toggle_buttons()
         self._redraw()
 
-    def _apply_filter_controls(self):
+    def _on_filter_sliders(self, _val: float):
         f1 = float(self.sl_f1.val)
         f2 = float(self.sl_f2.val)
         f3 = float(self.sl_f3.val)
         f4 = float(self.sl_f4.val)
         if not (f1 < f2 < f3 < f4):
-            print("     [WARN] Need f1 < f2 < f3 < f4")
+            # Ignore transient invalid states while dragging neighboring sliders.
             return
         self._f1, self._f2, self._f3, self._f4 = f1, f2, f3, f4
-        self._recompute_filter()
-        self._redraw()
+        self._schedule_filter_update()
 
     # ---- data --------------------------------------------------------------
 
     def _active_data(self) -> Any:
-        d = self.data_filt if self._filter_on else self.data_raw
+        if self._filter_mode == "ormsby":
+            d = self.data_ormsby
+        elif self._filter_mode == "butter":
+            d = self.data_butter
+        else:
+            d = self.data_raw
         d = apply_gain(d, self.dt_s, mode=self._gain_mode,
                        window_ms=self._agc_window_ms, stat=self._agc_stat)
         return -d if self._inverted else d
 
     def _recompute_filter(self):
-        self.data_filt = apply_ormsby_all_params(
+        self.data_ormsby = apply_ormsby_all_params(
             self.data_raw, self.dt_s, self._f1, self._f2, self._f3, self._f4
+        )
+        self.data_butter = apply_butterworth_all_params(
+            self.data_raw, self.dt_s,
+            low_hz=self._f2, high_hz=self._f3,
+            order=self._butter_order,
         )
 
     # ---- drawing -----------------------------------------------------------
@@ -2117,9 +2232,14 @@ class FirstBreakPicker:
         dt_ms  = self.dt_s * 1000.0
         n_samp = self.n_samp
         t_end  = self.delay_ms + (n_samp - 1) * dt_ms
-        filt_str = (f"Ormsby {self._f1:.0f}-{self._f2:.0f}-{self._f3:.0f}-{self._f4:.0f} Hz  "
-                    + ("ON" if self._filter_on else "OFF")
-                    + ("  [INV]" if self._inverted else ""))
+        if self._filter_mode == "ormsby":
+            filt_str = f"Ormsby {self._f1:.0f}-{self._f2:.0f}-{self._f3:.0f}-{self._f4:.0f} Hz"
+        elif self._filter_mode == "butter":
+            filt_str = f"Butterworth order {self._butter_order} ({self._f2:.0f}-{self._f3:.0f} Hz)"
+        else:
+            filt_str = "Filter none"
+        if self._inverted:
+            filt_str += "  [INV]"
         title = (f"Profile: {self.profile}  |  Shot {self.shot_id}  |"
                  f"  {n_samp} smp  dt={dt_ms:.4f} ms  "
                  f"delay={self.delay_ms:.1f} ms  end={t_end:.1f} ms  |"
@@ -2129,7 +2249,7 @@ class FirstBreakPicker:
         self.ax.set_xlabel("Receiver position (m)", color=c["label"], fontsize=8)
         self.ax.text(
             0.0, -0.14,
-            "L:pick  R:delete  Shift+L:range  a:auto  f:filter  g:gain  v:polarity  l:timeline  c:top axis  s/n:save+next  p:prev  q:quit",
+            "L:pick  R:delete  Shift+L:range  a:auto  f:filter mode  g:gain  v:polarity  l:timeline  c:top axis  s/n:save+next  p:prev  q:quit",
             transform=self.ax.transAxes,
             ha="left", va="top",
             color=c["label"], fontsize=7,
@@ -2191,7 +2311,9 @@ class FirstBreakPicker:
             f"Shot (m)       : {self.shot_pos_m:.2f}\n"
             f"Gain           : {self._gain_mode} ({self._agc_stat}, {self._agc_window_ms:.0f} ms)\n"
             f"Display / Scale: {self._display_mode} / {self._wiggle_stretch:.2f}\n"
-            f"Filter (Hz)    : {self._f1:.1f}-{self._f2:.1f}-{self._f3:.1f}-{self._f4:.1f}\n"
+            f"Filter mode    : {self._filter_mode}\n"
+            f"Ormsby (Hz)    : {self._f1:.1f}-{self._f2:.1f}-{self._f3:.1f}-{self._f4:.1f}\n"
+            f"Butter (Hz)    : {self._f2:.1f}-{self._f3:.1f} (order {self._butter_order})\n"
             f"Time view (ms) : {self._t_view_start:.1f} .. {self._t_view_end:.1f}\n"
             f"Polarity       : {'inverse' if self._inverted else 'normal'}\n"
             f"Timelines      : {'on' if self._show_timelines else 'off'}"
@@ -2368,24 +2490,23 @@ class FirstBreakPicker:
             # Save a per-shot QC screenshot (separate from pick-saving)
             self._save_qc_image()
         elif key == "f":
-            self._filter_on = not self._filter_on
+            self._filter_mode = {"none": "butter", "butter": "ormsby", "ormsby": "none"}.get(
+                self._filter_mode, "none"
+            )
+            self._refresh_mode_buttons()
             self._redraw()
         elif key == "u":
             self._f2 = max(self._f1 + 0.5, self._f2 + 1.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "j":
             self._f2 = max(self._f1 + 0.5, self._f2 - 1.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "i":
             self._f3 = min(self._f4 - 1.0, self._f3 + 5.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "m":
             self._f3 = max(self._f2 + 1.0, self._f3 - 5.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "g":
             self._gain_mode = ({"none": "norm", "norm": "agc", "agc": "none"}
                                .get(self._gain_mode, "none"))
