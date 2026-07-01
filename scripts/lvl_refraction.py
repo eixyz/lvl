@@ -94,6 +94,7 @@ _ensure("obspy")
 _ensure("matplotlib")
 _ensure("openpyxl")
 _ensure("scipy")
+_ensure("xlrd")
 
 from obspy import read as _read_obspy          # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
@@ -103,6 +104,7 @@ from scipy.signal import butter as _scipy_butter, sosfiltfilt as _scipy_sosfiltf
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
+import pandas as pd
 
 
 # ===========================================================================
@@ -322,6 +324,291 @@ def auto_shot_positions(recv_pos: Any) -> dict:
     }
 
 
+def _excel_col_to_index(col: str) -> int:
+    """Convert Excel column label (A, D, AA, ...) to zero-based index."""
+    s = str(col or "").strip().upper()
+    if not s or not all("A" <= ch <= "Z" for ch in s):
+        raise ValueError(f"Invalid Excel column label '{col}'")
+    out = 0
+    for ch in s:
+        out = out * 26 + (ord(ch) - ord("A") + 1)
+    return out - 1
+
+
+def _normalize_profile_token(value: Any) -> str:
+    """
+    Normalize profile strings for robust matching.
+
+    Examples:
+      "LVL150" -> "150"
+      "150" -> "150"
+      "LVL214_A" -> "214_A"
+    """
+    s = str(value or "").strip().upper().replace(" ", "")
+    s = s.replace("_", "").replace("-", "")
+    if s.startswith("LVL"):
+        s = s[3:]
+    return s
+
+
+def discover_field_report_excel(data_dir: Path) -> Path | None:
+    """Find likely field-report Excel files in data directory; return newest match."""
+    pats = [
+        "field_report*.xls",
+        "field_report*.xlsx",
+        "fieldreport*.xls",
+        "fieldreport*.xlsx",
+    ]
+    cand: list = []
+    for pat in pats:
+        cand.extend(list(data_dir.glob(pat)))
+    if not cand:
+        return None
+    cand_sorted = sorted(cand, key=lambda p: p.stat().st_mtime, reverse=True)
+    return cand_sorted[0]
+
+
+def _read_excel_table(path: Path, sheet_name: str | int | None = None) -> Any:
+    """Read Excel with fallback engines for both .xls and .xlsx files."""
+    sheet = (0 if sheet_name is None else sheet_name)
+
+    # First try pandas default engine resolution.
+    try:
+        return pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+    except Exception:
+        pass
+
+    suffix = str(path.suffix).lower()
+    last_exc: Exception | None = None
+
+    if suffix == ".xls":
+        try:
+            return pd.read_excel(path, sheet_name=sheet, header=None, dtype=object, engine="xlrd")
+        except Exception as exc:
+            last_exc = exc
+    else:
+        try:
+            return pd.read_excel(path, sheet_name=sheet, header=None, dtype=object, engine="openpyxl")
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError(f"Could not read Excel file: {path}")
+
+
+def infer_geometry_from_field_report(path: Path,
+                                     profile_name: str,
+                                     sheet_name: str | int | None = None) -> int | None:
+    """
+    Infer geometry from field report notes near profile markers.
+
+        Rule:
+            - find row containing LVL<profile>
+            - inspect nearby rows (+/- 1..2)
+      - if any cell contains 'short' (or 'short profile'), geometry = 100
+      - otherwise return None
+    """
+    if not path.exists():
+        return None
+
+    df = _read_excel_table(path, sheet_name=sheet_name)
+    if df is None or df.empty:
+        return None
+
+    prof_tok = _normalize_profile_token(profile_name)
+    lvl_tag = f"LVL{prof_tok}"
+    n_rows = int(df.shape[0])
+
+    def _row_text(ridx: int) -> str:
+        vals = [str(v) for v in df.iloc[ridx].tolist() if pd.notna(v)]
+        return " ".join(vals).strip().lower()
+
+    for ridx in range(n_rows):
+        row_txt_up = _row_text(ridx).upper().replace(" ", "")
+        if lvl_tag not in row_txt_up:
+            continue
+
+        for delta in (-2, -1, 1, 2):
+            rr = ridx + delta
+            if rr >= n_rows:
+                continue
+            if rr < 0:
+                continue
+            txt = _row_text(rr)
+            if "short profile" in txt or "short" in txt:
+                return 100
+    return None
+
+
+def load_profile_offsets_from_excel(
+    path: Path,
+    profile_name: str,
+    ffid_by_shot: dict | None = None,
+    sheet_name: str | int | None = None,
+    ffid_col: str = "A",
+    perp_col: str = "D",
+    profile_col: str = "F",
+    inline_shift_col: str | None = None,
+) -> tuple:
+    """
+    Load per-shot perpendicular offsets (and optional inline shift) from Excel.
+
+        Expected table convention:
+            - vertically organized profile blocks
+            - first row contains LVLXXX in profile column
+            - continuation rows follow until next LVL row
+            - shot numbering often lives in column A as 1/2/3
+
+    Returns
+    -------
+    (perp_by_shot, inline_shift_by_shot)
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    df = _read_excel_table(path, sheet_name=sheet_name)
+    if df.empty:
+        return {}, {}
+
+    i_ffid = _excel_col_to_index(ffid_col)
+    i_perp = _excel_col_to_index(perp_col)
+    i_prof = _excel_col_to_index(profile_col)
+    i_shift = _excel_col_to_index(inline_shift_col) if inline_shift_col else None
+    need_cols = [i_ffid, i_perp, i_prof] + ([i_shift] if i_shift is not None else [])
+    if max(need_cols) >= df.shape[1]:
+        raise ValueError(
+            f"Excel has {df.shape[1]} columns; requested column index {max(need_cols)+1} is out of range"
+        )
+
+    target = _normalize_profile_token(profile_name)
+    ffid_to_shots: dict = {}
+    for sid in sorted(ffid_by_shot.keys() if ffid_by_shot else []):
+        try:
+            ff = int((ffid_by_shot or {}).get(sid, 0))
+            ss = int(sid)
+        except Exception:
+            continue
+        if ff <= 0:
+            continue
+        ffid_to_shots.setdefault(ff, []).append(ss)
+
+    rows_target: list = []
+    n_rows = int(df.shape[0])
+    lvl_starts: list = []
+    target_starts: list = []
+    for ridx in range(n_rows):
+        if i_prof >= df.shape[1]:
+            continue
+        p_raw = df.iat[ridx, i_prof]
+        p_txt = "" if pd.isna(p_raw) else str(p_raw).strip()
+        p_up = p_txt.upper().replace(" ", "")
+        if "LVL" not in p_up:
+            continue
+        lvl_starts.append(ridx)
+        if _normalize_profile_token(p_txt) == target:
+            target_starts.append(ridx)
+
+    for start in target_starts:
+        next_starts = [r for r in lvl_starts if r > start]
+        end = min(next_starts) if next_starts else n_rows
+        for ridx in range(start, end):
+            ffid_raw = df.iat[ridx, i_ffid]
+            perp_raw = df.iat[ridx, i_perp]
+            shift_raw = df.iat[ridx, i_shift] if i_shift is not None else 0.0
+
+            ffid = None
+            perp = None
+            shift = 0.0
+            try:
+                if pd.notna(ffid_raw) and str(ffid_raw).strip() != "":
+                    ffid = int(float(str(ffid_raw).replace(",", ".")))
+            except Exception:
+                ffid = None
+            try:
+                if pd.notna(perp_raw) and str(perp_raw).strip() != "":
+                    perp = float(str(perp_raw).replace(",", "."))
+            except Exception:
+                perp = None
+            try:
+                if pd.notna(shift_raw) and str(shift_raw).strip() != "":
+                    shift = float(str(shift_raw).replace(",", "."))
+            except Exception:
+                shift = 0.0
+
+            if perp is None:
+                continue
+
+            rows_target.append({"ffid": ffid, "perp": float(perp), "shift": float(shift)})
+
+    if not rows_target:
+        return {}, {}
+
+    perp_by_shot: dict = {}
+    shift_by_shot: dict = {}
+
+    # Many field sheets use column A as shot index (1/2/3).
+    shot_numbers = [int(r["ffid"]) for r in rows_target if r.get("ffid") is not None]
+    if shot_numbers:
+        uniq = sorted(set(shot_numbers))
+        if uniq and min(uniq) >= 1 and max(uniq) <= max(10, len(rows_target) + 1):
+            for row in rows_target:
+                sid = row.get("ffid")
+                if sid is None:
+                    continue
+                perp_by_shot[int(sid)] = float(row["perp"])
+                shift_by_shot[int(sid)] = float(row["shift"])
+            return perp_by_shot, shift_by_shot
+
+    if ffid_to_shots:
+        ffid_cursor: dict = {k: 0 for k in ffid_to_shots}
+        for row in rows_target:
+            ffid = row["ffid"]
+            if ffid is None:
+                continue
+            ff_key = int(ffid)
+            shot_list = ffid_to_shots.get(ff_key, [])
+            if not shot_list:
+                continue
+            cur = int(ffid_cursor.get(ff_key, 0))
+            sid = shot_list[min(cur, len(shot_list) - 1)]
+            ffid_cursor[ff_key] = cur + 1
+            perp_by_shot[int(sid)] = float(row["perp"])
+            shift_by_shot[int(sid)] = float(row["shift"])
+    else:
+        for i, row in enumerate(rows_target, start=1):
+            perp_by_shot[int(i)] = float(row["perp"])
+            shift_by_shot[int(i)] = float(row["shift"])
+
+    return perp_by_shot, shift_by_shot
+
+def read_perpendicular_offsets(path: Path) -> dict:
+    """
+    Read a simple text file with per-shot perpendicular offsets.
+
+    Format:
+        # shot_id  perp_m
+        1         0.0
+        2         3.5
+        3         0.0
+    """
+    out: dict = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            s = str(line).strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.replace(",", ".").split()
+            if len(parts) < 2:
+                continue
+            try:
+                sid = int(parts[0])
+                pov = float(parts[1])
+            except Exception:
+                continue
+            out[int(sid)] = float(pov)
+    return out
+
 def true_offset(inline_m: Any, perp_m: float) -> Any:
     """True source-receiver distance corrected for perpendicular shot offset."""
     return np.sqrt(np.asarray(inline_m, dtype=float) ** 2 + perp_m ** 2)
@@ -370,11 +657,26 @@ def resolve_perp_by_shot(cfg: dict, shot_ids: list,
     return per_shot
 
 
-def prompt_perp_by_shot(perp_by_shot: dict) -> dict:
-    """Interactive plot UI to edit per-shot perpendicular offsets (PO)."""
-    out = {int(k): float(v) for k, v in perp_by_shot.items()}
-    if not out:
-        return out
+def prompt_offset_model_by_shot(perp_by_shot: dict,
+                                inline_shift_by_shot: dict | None = None,
+                                shots_info: list | None = None,
+                                all_picks: dict | None = None,
+                                recv_positions: Any | None = None) -> tuple:
+    """
+    Interactive UI to edit per-shot geometric corrections.
+
+    - PO (m): perpendicular source-to-line distance.
+    - X-shift (m): optional inline distance shift for far-offset acquisition geometry.
+
+    A live preview panel redraws all shots together when values change.
+    """
+    out_po = {int(k): float(v) for k, v in (perp_by_shot or {}).items()}
+    out_shift = {int(k): float(v) for k, v in (inline_shift_by_shot or {}).items()}
+    for sid in out_po:
+        out_shift.setdefault(int(sid), 0.0)
+
+    if not out_po:
+        return out_po, out_shift
 
     try:
         backend = str(plt.get_backend()).lower()
@@ -382,39 +684,142 @@ def prompt_perp_by_shot(perp_by_shot: dict) -> dict:
         backend = ""
     if "agg" in backend and not _ensure_interactive_backend():
         print("  [INFO] Using default PO values (interactive PO window unavailable).")
-        return out
+        return out_po, out_shift
 
     c = _tc()
-    shot_ids = sorted(out)
+    shot_ids = sorted(out_po)
     n = len(shot_ids)
-    fig_h = max(3.2, min(8.0, 1.9 + 0.62 * n))
-    fig = plt.figure(figsize=(7.2, fig_h))
+    fig_h = max(5.6, min(11.0, 3.3 + 0.55 * n))
+    fig = plt.figure(figsize=(11.2, fig_h))
     fig.patch.set_facecolor(c["fig_bg"])
-    fig.text(0.05, 0.95, "Perpendicular offset setup (PO)",
+    fig.text(0.04, 0.95, "Shot Geometry Setup (PO + X-shift)",
              color=c["text"], fontsize=12, fontweight="bold", va="top")
-    fig.text(0.05, 0.90,
-             "Set PO (m) per shot. Click 'Use Values' to continue.",
+    fig.text(0.04, 0.90,
+             "Adjust PO and optional inline shift. Press Enter in a field for live update.",
              color=c["label"], fontsize=9, va="top")
 
     top = 0.82
-    row_h = 0.07
-    textboxes: dict = {}
+    row_h = 0.055
+    textboxes_po: dict = {}
+    textboxes_shift: dict = {}
     for i, sid in enumerate(shot_ids):
         y = top - i * row_h
-        fig.text(0.08, y + 0.017, f"Shot {sid}", color=c["text"], fontsize=9,
+        fig.text(0.04, y + 0.017, f"Shot {sid}", color=c["text"], fontsize=9,
                  ha="left", va="center")
-        ax_tb = fig.add_axes([0.22, y, 0.20, 0.045])
-        tb = TextBox(ax_tb, "PO (m)", initial=f"{out[sid]:.3f}")
-        tb.label.set_color(c["text"])
-        tb.label.set_fontsize(8)
-        tb.text_disp.set_color(c["text"])
-        tb.text_disp.set_fontsize(9)
-        ax_tb.set_facecolor(c["ax_bg"])
-        for sp in ax_tb.spines.values():
+        ax_tb_po = fig.add_axes([0.11, y, 0.12, 0.038])
+        tb_po = TextBox(ax_tb_po, "PO", initial=f"{out_po[sid]:.3f}")
+        tb_po.label.set_color(c["text"])
+        tb_po.label.set_fontsize(8)
+        tb_po.text_disp.set_color(c["text"])
+        tb_po.text_disp.set_fontsize(9)
+        ax_tb_po.set_facecolor(c["ax_bg"])
+        for sp in ax_tb_po.spines.values():
             sp.set_edgecolor(c["spine"])
-        textboxes[sid] = tb
 
-    status_ax = fig.add_axes([0.05, 0.12, 0.68, 0.06])
+        ax_tb_shift = fig.add_axes([0.25, y, 0.12, 0.038])
+        tb_shift = TextBox(ax_tb_shift, "X-shift", initial=f"{out_shift.get(sid, 0.0):.3f}")
+        tb_shift.label.set_color(c["text"])
+        tb_shift.label.set_fontsize(8)
+        tb_shift.text_disp.set_color(c["text"])
+        tb_shift.text_disp.set_fontsize(9)
+        ax_tb_shift.set_facecolor(c["ax_bg"])
+        for sp in ax_tb_shift.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+        textboxes_po[sid] = tb_po
+        textboxes_shift[sid] = tb_shift
+
+    ax_prev = fig.add_axes([0.41, 0.16, 0.55, 0.70])
+    ax_prev.set_facecolor(c["ax_bg"])
+    for sp in ax_prev.spines.values():
+        sp.set_edgecolor(c["spine"])
+    ax_prev.grid(True, lw=0.3, alpha=0.30, color=c["grid"])
+    ax_prev.tick_params(colors=c["tick"])
+    ax_prev.set_xlabel("True offset (m)", color=c["label"], fontsize=8)
+    ax_prev.set_ylabel("FB time (ms)", color=c["label"], fontsize=8)
+    ax_prev.set_title("Live preview: all shots", color=c["text"], fontsize=9)
+
+    def _read_float(tb: Any, fallback: float) -> float:
+        try:
+            txt = str(tb.text).strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            return float(fallback)
+        try:
+            return float(txt.replace(",", "."))
+        except Exception:
+            return float(fallback)
+
+    def _read_ui_values() -> tuple:
+        po_new = dict(out_po)
+        sh_new = dict(out_shift)
+        for sid in shot_ids:
+            po_new[sid] = _read_float(textboxes_po[sid], po_new.get(sid, 0.0))
+            sh_new[sid] = _read_float(textboxes_shift[sid], sh_new.get(sid, 0.0))
+        return po_new, sh_new
+
+    def _redraw_preview(po_map: dict, sh_map: dict):
+        ax_prev.clear()
+        ax_prev.set_facecolor(c["ax_bg"])
+        ax_prev.grid(True, lw=0.3, alpha=0.30, color=c["grid"])
+        ax_prev.tick_params(colors=c["tick"])
+        ax_prev.set_xlabel("True offset (m)", color=c["label"], fontsize=8)
+        ax_prev.set_ylabel("FB time (ms)", color=c["label"], fontsize=8)
+        ax_prev.set_title("Live preview: all shots", color=c["text"], fontsize=9)
+
+        if not (shots_info and all_picks and recv_positions is not None):
+            ax_prev.text(0.5, 0.5, "Preview unavailable (missing picks/geometry)",
+                         transform=ax_prev.transAxes, ha="center", va="center",
+                         color=c["label"], fontsize=8)
+            fig.canvas.draw_idle()
+            return
+
+        pal = ["#e63946", "#2a9d8f", "#e9c46a", "#457b9d", "#f4a261", "#8d99ae"]
+        plotted = 0
+        for i, (sid, shot_pos) in enumerate(shots_info):
+            sid_i = int(sid)
+            picks = apply_bulk_static((all_picks or {}).get(sid_i, {}))
+            if not picks:
+                continue
+            po = float(po_map.get(sid_i, 0.0))
+            x_shift = float(sh_map.get(sid_i, 0.0))
+            xvals: list = []
+            tvals: list = []
+            for tr in sorted(picks):
+                if tr >= len(recv_positions):
+                    continue
+                inline_abs = abs(float(recv_positions[tr]) - float(shot_pos))
+                inline_corr = max(0.0, inline_abs + x_shift)
+                x_true = float(true_offset(inline_corr, po))
+                xvals.append(x_true)
+                tvals.append(float(picks[tr]))
+            if len(xvals) < 2:
+                continue
+            col = pal[i % len(pal)]
+            order = np.argsort(np.asarray(xvals, dtype=float))
+            xs = np.asarray(xvals, dtype=float)[order]
+            ts = np.asarray(tvals, dtype=float)[order]
+            ax_prev.plot(xs, ts, "o-", ms=3.5, lw=1.0, alpha=0.9, color=col,
+                         label=f"Shot {sid_i}  PO={po:.2f}m  dX={x_shift:.2f}m")
+            plotted += 1
+
+        if plotted > 0:
+            ax_prev.legend(fontsize=7, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
+                           labelcolor=c["text"], loc="best")
+            ax_prev.set_ylim(T_MAX_MS, 0.0)
+        else:
+            ax_prev.text(0.5, 0.5, "No picks available for preview", transform=ax_prev.transAxes,
+                         ha="center", va="center", color=c["label"], fontsize=8)
+        fig.canvas.draw_idle()
+
+    def _apply_preview(_evt: Any = None):
+        po_map, sh_map = _read_ui_values()
+        _redraw_preview(po_map, sh_map)
+
+    _apply_preview()
+
+    status_ax = fig.add_axes([0.04, 0.08, 0.58, 0.05])
     status_ax.set_facecolor(c["ax_bg"])
     status_ax.set_xticks([])
     status_ax.set_yticks([])
@@ -424,13 +829,16 @@ def prompt_perp_by_shot(perp_by_shot: dict) -> dict:
                                 fontsize=8, va="center", ha="left",
                                 transform=status_ax.transAxes)
 
-    ax_ok = fig.add_axes([0.76, 0.12, 0.18, 0.06])
-    ax_def = fig.add_axes([0.76, 0.20, 0.18, 0.06])
+    ax_ok = fig.add_axes([0.64, 0.08, 0.15, 0.05])
+    ax_ref = fig.add_axes([0.81, 0.08, 0.15, 0.05])
+    ax_def = fig.add_axes([0.81, 0.14, 0.15, 0.05])
     btn_ok = Button(ax_ok, "Use Values", color=c["ax_bg"],
                     hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d")
+    btn_ref = Button(ax_ref, "Refresh", color=c["ax_bg"],
+                     hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d")
     btn_def = Button(ax_def, "Use Defaults", color=c["ax_bg"],
                      hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d")
-    for btn in (btn_ok, btn_def):
+    for btn in (btn_ok, btn_ref, btn_def):
         btn.label.set_color(c["text"])
         btn.label.set_fontsize(8)
         for sp in btn.ax.spines.values():
@@ -447,7 +855,17 @@ def prompt_perp_by_shot(perp_by_shot: dict) -> dict:
             pass
 
     btn_ok.on_clicked(lambda _e: _finish(False))
+    btn_ref.on_clicked(_apply_preview)
     btn_def.on_clicked(lambda _e: _finish(True))
+
+    for sid in shot_ids:
+        textboxes_po[sid].on_submit(lambda _txt, _sid=sid: _apply_preview())
+        textboxes_shift[sid].on_submit(lambda _txt, _sid=sid: _apply_preview())
+        try:
+            textboxes_po[sid].on_text_change(lambda _txt, _sid=sid: _apply_preview())
+            textboxes_shift[sid].on_text_change(lambda _txt, _sid=sid: _apply_preview())
+        except Exception:
+            pass
 
     def _on_key(evt: Any):
         if evt.key == "enter":
@@ -473,34 +891,32 @@ def prompt_perp_by_shot(perp_by_shot: dict) -> dict:
                 plt.close(fig)
         except Exception:
             pass
-        return out
+        return out_po, out_shift
 
     for sid in shot_ids:
-        cur = out[sid]
-        txt = ""
-        try:
-            txt = str(textboxes[sid].text).strip()
-        except Exception:
-            txt = ""
-        if not txt:
-            continue
-        try:
-            out[sid] = float(txt.replace(",", "."))
-        except Exception:
-            status_txt.set_text(f"Invalid PO for Shot {sid}; keeping {cur:.3f}")
-            out[sid] = cur
+        cur_po = out_po[sid]
+        cur_shift = out_shift.get(sid, 0.0)
+        out_po[sid] = _read_float(textboxes_po[sid], cur_po)
+        out_shift[sid] = _read_float(textboxes_shift[sid], cur_shift)
+        if not np.isfinite(out_po[sid]):
+            status_txt.set_text(f"Invalid PO for Shot {sid}; keeping {cur_po:.3f}")
+            out_po[sid] = cur_po
+        if not np.isfinite(out_shift[sid]):
+            status_txt.set_text(f"Invalid X-shift for Shot {sid}; keeping {cur_shift:.3f}")
+            out_shift[sid] = cur_shift
 
     try:
         if plt.fignum_exists(fig.number):
             plt.close(fig)
     except Exception:
         pass
-    return out
+    return out_po, out_shift
 
 
 def build_corrected_pick_data(shots_info: list, all_picks: dict,
                               recv_positions: Any,
-                              perp_by_shot: dict | None = None) -> dict:
+                              perp_by_shot: dict | None = None,
+                              inline_shift_by_shot: dict | None = None) -> dict:
     """
     Build per-shot corrected pick rows with true offset and interpolated travel-time.
 
@@ -523,6 +939,7 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
 
         bulk_picks = apply_bulk_static(raw_picks)
         po = float((perp_by_shot or {}).get(int(shot_id), 0.0))
+        x_shift = float((inline_shift_by_shot or {}).get(int(shot_id), 0.0))
         rows: list = []
 
         for trace_idx in sorted(raw_picks):
@@ -531,7 +948,8 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
             recv_pos = float(recv_positions[trace_idx])
             inline_signed = recv_pos - float(shot_pos_m)
             inline_abs = abs(inline_signed)
-            true_off = float(true_offset(inline_abs, po))
+            inline_corr = max(0.0, float(inline_abs + x_shift))
+            true_off = float(true_offset(inline_corr, po))
             side = "L" if inline_signed < 0.0 else "R"
 
             rows.append({
@@ -541,6 +959,8 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
                 "shot_pos_m": float(shot_pos_m),
                 "inline_signed_m": float(inline_signed),
                 "inline_abs_m": float(inline_abs),
+                "inline_shift_m": float(x_shift),
+                "inline_corr_m": float(inline_corr),
                 "perp_m": po,
                 "true_off_m": true_off,
                 "fb_raw_ms": float(raw_picks[trace_idx]),
@@ -558,7 +978,7 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
             part_sorted = sorted(part, key=lambda r: (r["inline_abs_m"], r["trace_idx"]))
             x_true = np.array([r["true_off_m"] for r in part_sorted], dtype=float)
             t_bulk = np.array([r["fb_bulk_ms"] for r in part_sorted], dtype=float)
-            x_inline = np.array([r["inline_abs_m"] for r in part_sorted], dtype=float)
+            x_inline = np.array([r["inline_corr_m"] for r in part_sorted], dtype=float)
 
             if np.allclose(x_true, x_true[0]):
                 t_interp = t_bulk.copy()
@@ -595,6 +1015,7 @@ class AnalysisWorkflow:
                  shots_info: list, shot_label_pos: dict,
                  all_picks: dict, recv_positions: Any,
                  perp_override: dict | None = None,
+                 inline_shift_override: dict | None = None,
                  enable_layer_pick: bool = True,
                  existing_layer_results: dict | None = None):
         self.profile_name = profile_name
@@ -604,27 +1025,40 @@ class AnalysisWorkflow:
         self.all_picks = all_picks
         self.recv_positions = recv_positions
         self.perp_override = perp_override or {}
+        self.inline_shift_override = inline_shift_override or {}
         self.enable_layer_pick = bool(enable_layer_pick)
         self.existing_layer_results = existing_layer_results or {}
 
         self.perp_by_shot: dict = {}
+        self.inline_shift_by_shot: dict = {}
         self.corrected_by_shot: dict = {}
         self.layer_results: dict = {}
 
     def run(self) -> dict:
         shot_ids = [sid for sid, _ in self.shots_info]
         self.perp_by_shot = resolve_perp_by_shot(self.cfg, shot_ids, self.perp_override)
+        self.inline_shift_by_shot = {int(sid): 0.0 for sid in shot_ids}
+        for sid, val in (self.inline_shift_override or {}).items():
+            self.inline_shift_by_shot[int(sid)] = float(val)
 
         print("  Step 1/2: Perpendicular offset (PO) setup")
-        if not self.perp_override:
-            self.perp_by_shot = prompt_perp_by_shot(self.perp_by_shot)
+        self.perp_by_shot, self.inline_shift_by_shot = prompt_offset_model_by_shot(
+            self.perp_by_shot,
+            inline_shift_by_shot=self.inline_shift_by_shot,
+            shots_info=self.shots_info,
+            all_picks=self.all_picks,
+            recv_positions=self.recv_positions,
+        )
         print("  Perp offsets by shot: "
               + ", ".join(f"S{sid}={self.perp_by_shot.get(sid, 0.0):.2f}m" for sid in shot_ids))
+        print("  Inline shift by shot: "
+              + ", ".join(f"S{sid}={self.inline_shift_by_shot.get(sid, 0.0):.2f}m" for sid in shot_ids))
 
         print("  Step 2/2: Corrected picks and layer windows")
         self.corrected_by_shot = build_corrected_pick_data(
             self.shots_info, self.all_picks, self.recv_positions,
             perp_by_shot=self.perp_by_shot,
+            inline_shift_by_shot=self.inline_shift_by_shot,
         )
 
         if self.enable_layer_pick:
@@ -637,6 +1071,7 @@ class AnalysisWorkflow:
 
         return {
             "perp_by_shot": self.perp_by_shot,
+            "inline_shift_by_shot": self.inline_shift_by_shot,
             "corrected_by_shot": self.corrected_by_shot,
             "layer_results": self.layer_results,
         }
@@ -929,7 +1364,7 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
     fig.patch.set_facecolor(c["fig_bg"])
     ax.set_facecolor(c["ax_bg"])
     ax.plot(x_vals, t_vals, "o-", ms=4, lw=1.2, color="#1f77b4")
-    ax.set_xlabel("Inline offset |x - SP| (m)", color=c["label"])
+    ax.set_xlabel("Corrected true offset XO (m)", color=c["label"])
     ax.set_ylabel("Corrected travel-time (ms)", color=c["label"])
     ax.set_title(title + "\nPick x1..x6 with mouse (LMB). Use buttons on right.",
                  color=c["text"], fontsize=10)
@@ -1172,6 +1607,196 @@ def _fit_layers_from_windows(x_vals: Any, t_vals: Any, windows: list) -> dict:
     }
 
 
+def _compute_fit_rms(x_vals: Any, t_vals: Any, fit_res: dict) -> float:
+    """Compute RMS(ms) between observed and fitted times for given x-values."""
+    x = np.asarray(x_vals, dtype=float)
+    t = np.asarray(t_vals, dtype=float)
+    if x.size == 0 or t.size == 0:
+        return 0.0
+    pred: list = []
+    obs: list = []
+    for xv, tv in zip(x, t):
+        tp = _predict_time_from_fit(float(xv), fit_res)
+        if tp is None:
+            continue
+        pred.append(float(tp))
+        obs.append(float(tv))
+    if not pred:
+        return 0.0
+    pa = np.asarray(pred, dtype=float)
+    oa = np.asarray(obs, dtype=float)
+    return float(np.sqrt(np.mean((oa - pa) ** 2)))
+
+
+def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
+                                  fit_res: dict, title: str) -> str:
+    """
+    Review layer fit and choose action.
+
+    Returns one of: "accept", "repick", "skip".
+    """
+    try:
+        backend = str(plt.get_backend()).lower()
+    except Exception:
+        backend = ""
+    if "agg" in backend and not _ensure_interactive_backend():
+        return "accept"
+
+    c = _tc()
+    x = np.asarray(x_vals, dtype=float)
+    t = np.asarray(t_vals, dtype=float)
+    if x.size < 2 or t.size < 2:
+        return "accept"
+
+    rms = _compute_fit_rms(x, t, fit_res)
+    nfit = int(sum(_predict_time_from_fit(float(xx), fit_res) is not None for xx in x))
+
+    fig, (ax_tx, ax_cmp) = plt.subplots(1, 2, figsize=(12.2, 5.0), constrained_layout=False)
+    fig.subplots_adjust(left=0.06, right=0.82, bottom=0.12, top=0.88, wspace=0.22)
+    fig.patch.set_facecolor(c["fig_bg"])
+    ax_tx.set_facecolor(c["ax_bg"])
+    ax_cmp.set_facecolor(c["ax_bg"])
+
+    ax_tx.plot(x, t, "o", ms=4, color="#1f77b4", alpha=0.9, label="Observed")
+    wins = list((fit_res or {}).get("windows", []) or [])
+    segs = list((fit_res or {}).get("segments", []) or [])
+    for i, seg in enumerate(segs):
+        sl = float(seg.get("slope_ms_m", 0.0))
+        ic = float(seg.get("intercept_ms", 0.0))
+        if sl <= 0.0:
+            continue
+        w = wins[i] if i < len(wins) else None
+        if w is not None:
+            x0, x1 = float(w[0]), float(w[1])
+        else:
+            x0, x1 = float(seg.get("x0", 0.0)), float(seg.get("x1", 0.0))
+        if x1 <= x0:
+            continue
+        xl = np.linspace(x0, x1, 40)
+        tl = sl * xl + ic
+        ax_tx.plot(xl, tl, "-", lw=1.6, alpha=0.9, color="#e63946")
+        xm = 0.5 * (x0 + x1)
+        tm = float(sl * xm + ic)
+        ax_tx.text(xm, tm - 2.0, f"V={seg.get('velocity_m_s', 0.0):.0f} m/s",
+                   fontsize=7, color="#e63946", ha="center")
+
+    pred_all: list = []
+    obs_all: list = []
+    for xv, tv in zip(x, t):
+        tp = _predict_time_from_fit(float(xv), fit_res)
+        if tp is None:
+            continue
+        obs_all.append(float(tv))
+        pred_all.append(float(tp))
+
+    if obs_all:
+        oa = np.asarray(obs_all, dtype=float)
+        pa = np.asarray(pred_all, dtype=float)
+        ax_cmp.scatter(oa, pa, s=24, color="#2a9d8f", alpha=0.9)
+        lo = float(min(oa.min(), pa.min()))
+        hi = float(max(oa.max(), pa.max()))
+        pad = max(1.0, 0.03 * (hi - lo))
+        lo -= pad
+        hi += pad
+        ax_cmp.plot([lo, hi], [lo, hi], "--", lw=1.1, color="#555555")
+        ax_cmp.set_xlim(lo, hi)
+        ax_cmp.set_ylim(lo, hi)
+    else:
+        ax_cmp.text(0.5, 0.5, "No predicted points", transform=ax_cmp.transAxes,
+                    ha="center", va="center", color=c["label"], fontsize=8)
+
+    ax_tx.set_xlabel("Corrected true offset XO (m)", color=c["label"], fontsize=8)
+    ax_tx.set_ylabel("Corrected travel-time (ms)", color=c["label"], fontsize=8)
+    ax_tx.set_title("Observed with fitted segments", color=c["text"], fontsize=9)
+    ax_tx.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+    ax_tx.tick_params(colors=c["tick"], labelsize=8)
+
+    ax_cmp.set_xlabel("Observed (ms)", color=c["label"], fontsize=8)
+    ax_cmp.set_ylabel("Computed (ms)", color=c["label"], fontsize=8)
+    ax_cmp.set_title("Observed vs Computed", color=c["text"], fontsize=9)
+    ax_cmp.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+    ax_cmp.tick_params(colors=c["tick"], labelsize=8)
+
+    for ax in (ax_tx, ax_cmp):
+        for sp in ax.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    fig.suptitle(
+        f"{title} | RMS={rms:.3f} ms (Nfit={nfit})",
+        color=c["text"], fontsize=10,
+    )
+
+    panel = fig.add_axes([0.84, 0.28, 0.14, 0.40])
+    panel.set_facecolor(c["ax_bg"])
+    panel.set_xticks([])
+    panel.set_yticks([])
+    for sp in panel.spines.values():
+        sp.set_edgecolor(c["spine"])
+    panel.text(0.06, 0.95,
+               "Fit review\n\n"
+               "Accept: keep this fit\n"
+               "Repick: choose windows again\n"
+               "Skip: use previous/empty\n\n"
+               "Keys: Enter=Accept, r=Repick, Esc=Skip",
+               transform=panel.transAxes, va="top", ha="left",
+               fontsize=8, color=c["text"])
+
+    ax_acc = fig.add_axes([0.84, 0.20, 0.14, 0.06])
+    ax_rep = fig.add_axes([0.84, 0.12, 0.14, 0.06])
+    ax_skp = fig.add_axes([0.84, 0.04, 0.14, 0.06])
+    hover = "#e8e8e8" if THEME == "light" else "#2a2d3d"
+    b_acc = Button(ax_acc, "Accept", color=c["ax_bg"], hovercolor=hover)
+    b_rep = Button(ax_rep, "Repick", color=c["ax_bg"], hovercolor=hover)
+    b_skp = Button(ax_skp, "Skip", color=c["ax_bg"], hovercolor=hover)
+    for b in (b_acc, b_rep, b_skp):
+        b.label.set_color(c["text"])
+        b.label.set_fontsize(8)
+        for sp in b.ax.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    state = {"done": False, "choice": "accept"}
+
+    def _finish(choice: str):
+        if state["done"]:
+            return
+        state["done"] = True
+        state["choice"] = str(choice)
+        try:
+            fig.canvas.stop_event_loop()
+        except Exception:
+            pass
+
+    b_acc.on_clicked(lambda _e: _finish("accept"))
+    b_rep.on_clicked(lambda _e: _finish("repick"))
+    b_skp.on_clicked(lambda _e: _finish("skip"))
+
+    def _on_key(evt: Any):
+        if evt.key == "enter":
+            _finish("accept")
+        elif evt.key in ("r", "R"):
+            _finish("repick")
+        elif evt.key in ("escape", "q"):
+            _finish("skip")
+
+    def _on_close(_evt: Any):
+        _finish("skip")
+
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    fig.canvas.mpl_connect("close_event", _on_close)
+    plt.show(block=False)
+    while not state["done"] and plt.fignum_exists(fig.number):
+        try:
+            fig.canvas.start_event_loop(0.05)
+        except Exception:
+            break
+    try:
+        if plt.fignum_exists(fig.number):
+            plt.close(fig)
+    except Exception:
+        pass
+    return str(state.get("choice", "accept"))
+
+
 def pick_layer_windows_interactive(profile_name: str,
                                    corrected_by_shot: dict,
                                    existing_results: dict | None = None) -> dict:
@@ -1210,34 +1835,63 @@ def pick_layer_windows_interactive(profile_name: str,
             continue
 
         for side, side_rows in side_candidates:
-            side_rows = sorted(side_rows, key=lambda r: r["inline_abs_m"])
-            x = np.array([r["inline_abs_m"] for r in side_rows], dtype=float)
+            side_rows = sorted(side_rows, key=lambda r: r.get("true_off_m", 0.0))
+            x = np.array([r.get("true_off_m", 0.0) for r in side_rows], dtype=float)
             t = np.array([r["fb_interp_inline_ms"] for r in side_rows], dtype=float)
             title = f"Profile {profile_name} | Shot {shot_id} | Side {side}"
             print(f"     Opening layer-window picker: Shot {shot_id} Side {side}")
-            pick_payload = _pick_layer_windows_from_plot(x, t, title)
-            windows = pick_payload.get("windows", [None, None, None])
-            picked_points = pick_payload.get("picked_points", [])
-            if all(w is None for w in windows):
-                prev = ((existing.get(int(shot_id), {}) or {}).get(side))
-                if prev:
-                    per_side[side] = prev
-                    print(f"     Shot {shot_id} Side {side}: skipped by user, kept previous layer picks.")
-                else:
-                    fit_res = _fit_layers_from_windows(x, t, windows)
-                    fit_res["windows"] = windows
-                    fit_res["picked_points"] = picked_points
-                    fit_res["n_points"] = int(len(x))
-                    fit_res["skipped"] = True
-                    per_side[side] = fit_res
-                    print(f"     Shot {shot_id} Side {side}: skipped by user, saved empty layer selection.")
-                continue
-            fit_res = _fit_layers_from_windows(x, t, windows)
-            fit_res["windows"] = windows
-            fit_res["picked_points"] = picked_points
-            fit_res["n_points"] = int(len(x))
-            fit_res["skipped"] = False
-            per_side[side] = fit_res
+
+            while True:
+                pick_payload = _pick_layer_windows_from_plot(x, t, title)
+                windows = pick_payload.get("windows", [None, None, None])
+                picked_points = pick_payload.get("picked_points", [])
+
+                if all(w is None for w in windows):
+                    prev = ((existing.get(int(shot_id), {}) or {}).get(side))
+                    if prev:
+                        per_side[side] = prev
+                        print(f"     Shot {shot_id} Side {side}: skipped by user, kept previous layer picks.")
+                    else:
+                        fit_res = _fit_layers_from_windows(x, t, windows)
+                        fit_res["windows"] = windows
+                        fit_res["picked_points"] = picked_points
+                        fit_res["n_points"] = int(len(x))
+                        fit_res["skipped"] = True
+                        fit_res["rms_ms"] = 0.0
+                        per_side[side] = fit_res
+                        print(f"     Shot {shot_id} Side {side}: skipped by user, saved empty layer selection.")
+                    break
+
+                fit_res = _fit_layers_from_windows(x, t, windows)
+                fit_res["windows"] = windows
+                fit_res["picked_points"] = picked_points
+                fit_res["n_points"] = int(len(x))
+                fit_res["skipped"] = False
+                fit_res["rms_ms"] = _compute_fit_rms(x, t, fit_res)
+
+                choice = _review_layer_fit_interactive(x, t, fit_res, title)
+                if choice == "repick":
+                    print(f"     Shot {shot_id} Side {side}: re-pick requested.")
+                    continue
+                if choice == "skip":
+                    prev = ((existing.get(int(shot_id), {}) or {}).get(side))
+                    if prev:
+                        per_side[side] = prev
+                        print(f"     Shot {shot_id} Side {side}: skipped in review, kept previous layer picks.")
+                    else:
+                        fit_res_empty = _fit_layers_from_windows(x, t, [None, None, None])
+                        fit_res_empty["windows"] = [None, None, None]
+                        fit_res_empty["picked_points"] = []
+                        fit_res_empty["n_points"] = int(len(x))
+                        fit_res_empty["skipped"] = True
+                        fit_res_empty["rms_ms"] = 0.0
+                        per_side[side] = fit_res_empty
+                        print(f"     Shot {shot_id} Side {side}: skipped in review.")
+                    break
+
+                per_side[side] = fit_res
+                print(f"     Shot {shot_id} Side {side}: accepted fit, RMS={fit_res.get('rms_ms', 0.0):.3f} ms")
+                break
 
         if per_side:
             results[int(shot_id)] = per_side
@@ -1316,7 +1970,7 @@ def compute_layer_averages(layer_results: dict, shot_pos_by_id: dict) -> dict:
 
 
 def _predict_time_from_fit(x_abs: float, fit_res: dict) -> float | None:
-    """Predict t(ms) at absolute inline offset x_abs from fitted layer windows."""
+    """Predict t(ms) at corrected true offset x_abs from fitted layer windows."""
     windows = list((fit_res or {}).get("windows", []) or [])
     windows += [None] * (3 - len(windows))
     segs = list((fit_res or {}).get("segments", []) or [])
@@ -1390,7 +2044,7 @@ def build_analysis_from_layers(corrected_by_shot: dict,
         obs: list = []
         pred: list = []
         for r in rows_fit:
-            x_abs = float(r.get("inline_abs_m", 0.0))
+            x_abs = float(r.get("true_off_m", 0.0))
             t_obs = float(r.get("fb_interp_inline_ms", 0.0))
             t_pred = _predict_time_from_fit(x_abs, fit_res)
             if t_pred is None:
@@ -1469,7 +2123,7 @@ def export_fit_plot(profile_name: str,
         pred: list = []
         for r in rows_fit:
             t_obs = float(r.get("fb_interp_inline_ms", 0.0))
-            t_pred = _predict_time_from_fit(float(r.get("inline_abs_m", 0.0)), fit_res)
+            t_pred = _predict_time_from_fit(float(r.get("true_off_m", 0.0)), fit_res)
             if t_pred is None:
                 continue
             obs.append(t_obs)
@@ -2959,7 +3613,8 @@ def export_excel(profile_name: str, shots_info: list,
 
         ws = wb.create_sheet(title=f"Shot_{shot_id}")
         col_headers = ["Trace", "FFID", "Recv_pos_m", "Shot_pos_m",
-                   "Inline_signed_m", "Inline_abs_m", "Perp_m", "True_off_m",
+               "Inline_signed_m", "Inline_abs_m", "Inline_shift_m", "Inline_corr_m",
+               "Perp_m", "True_off_m",
                    "FB_raw_ms", "FB_bulk_ms", "FB_interp_geom_ms", "Side"]
         for ci, h in enumerate(col_headers, 1):
             _chdr(ws, 1, ci, h)
@@ -2971,12 +3626,14 @@ def export_excel(profile_name: str, shots_info: list,
             ws.cell(row=row_i, column=4, value=round(float(row_d["shot_pos_m"]), 3))
             ws.cell(row=row_i, column=5, value=round(float(row_d["inline_signed_m"]), 3))
             ws.cell(row=row_i, column=6, value=round(float(row_d["inline_abs_m"]), 3))
-            ws.cell(row=row_i, column=7, value=round(float(row_d["perp_m"]), 3))
-            ws.cell(row=row_i, column=8, value=round(float(row_d["true_off_m"]), 3))
-            ws.cell(row=row_i, column=9, value=round(float(row_d["fb_raw_ms"]), 3))
-            ws.cell(row=row_i, column=10, value=round(float(row_d["fb_bulk_ms"]), 3))
-            ws.cell(row=row_i, column=11, value=round(float(row_d.get("fb_interp_geom_ms", row_d["fb_interp_inline_ms"])), 3))
-            ws.cell(row=row_i, column=12, value=str(row_d.get("side", "R")))
+            ws.cell(row=row_i, column=7, value=round(float(row_d.get("inline_shift_m", 0.0)), 3))
+            ws.cell(row=row_i, column=8, value=round(float(row_d.get("inline_corr_m", row_d["inline_abs_m"])), 3))
+            ws.cell(row=row_i, column=9, value=round(float(row_d["perp_m"]), 3))
+            ws.cell(row=row_i, column=10, value=round(float(row_d["true_off_m"]), 3))
+            ws.cell(row=row_i, column=11, value=round(float(row_d["fb_raw_ms"]), 3))
+            ws.cell(row=row_i, column=12, value=round(float(row_d["fb_bulk_ms"]), 3))
+            ws.cell(row=row_i, column=13, value=round(float(row_d.get("fb_interp_geom_ms", row_d["fb_interp_inline_ms"])), 3))
+            ws.cell(row=row_i, column=14, value=str(row_d.get("side", "R")))
 
             combined_rows.append({
                 "shot_id": shot_id,
@@ -2984,6 +3641,8 @@ def export_excel(profile_name: str, shots_info: list,
                 "recv_pos": float(row_d["recv_pos_m"]),
                 "shot_pos": float(row_d["shot_pos_m"]),
                 "inline_abs": float(row_d["inline_abs_m"]),
+                "inline_shift": float(row_d.get("inline_shift_m", 0.0)),
+                "inline_corr": float(row_d.get("inline_corr_m", row_d["inline_abs_m"])),
                 "true_off": float(row_d["true_off_m"]),
                 "fb_raw": float(row_d["fb_raw_ms"]),
                 "fb_bulk": float(row_d["fb_bulk_ms"]),
@@ -2998,8 +3657,8 @@ def export_excel(profile_name: str, shots_info: list,
         _chdr(ws, sum_row, 2, "Value")
         _chdr(ws, sum_row, 3, "Range used")
 
-        x_rng = f"H2:H{n_data + 1}"
-        t_rng = f"K2:K{n_data + 1}"
+        x_rng = f"J2:J{n_data + 1}"
+        t_rng = f"M2:M{n_data + 1}"
         for ri, (label, formula, basis) in enumerate([
             ("Velocity (m/s)",
              f"=IFERROR(1000/SLOPE({t_rng},{x_rng}),\"n/a\")",
@@ -3021,7 +3680,7 @@ def export_excel(profile_name: str, shots_info: list,
     if combined_rows:
         ws_c = wb.create_sheet(title="Combined")
         for ci, h in enumerate(["Shot_ID", "Trace", "Recv_pos_m", "Shot_pos_m",
-                     "Inline_abs_m", "True_off_m", "FB_raw_ms",
+                     "Inline_abs_m", "Inline_shift_m", "Inline_corr_m", "True_off_m", "FB_raw_ms",
                      "FB_bulk_ms", "FB_interp_geom_ms", "Side"], 1):
             _chdr(ws_c, 1, ci, h)
         for ri, row in enumerate(combined_rows, start=2):
@@ -3030,11 +3689,13 @@ def export_excel(profile_name: str, shots_info: list,
             ws_c.cell(row=ri, column=3, value=round(row["recv_pos"], 3))
             ws_c.cell(row=ri, column=4, value=round(row["shot_pos"], 3))
             ws_c.cell(row=ri, column=5, value=round(row["inline_abs"], 3))
-            ws_c.cell(row=ri, column=6, value=round(row["true_off"], 3))
-            ws_c.cell(row=ri, column=7, value=round(row["fb_raw"], 3))
-            ws_c.cell(row=ri, column=8, value=round(row["fb_bulk"], 3))
-            ws_c.cell(row=ri, column=9, value=round(row["fb_interp"], 3))
-            ws_c.cell(row=ri, column=10, value=row["side"])
+            ws_c.cell(row=ri, column=6, value=round(row.get("inline_shift", 0.0), 3))
+            ws_c.cell(row=ri, column=7, value=round(row.get("inline_corr", row["inline_abs"]), 3))
+            ws_c.cell(row=ri, column=8, value=round(row["true_off"], 3))
+            ws_c.cell(row=ri, column=9, value=round(row["fb_raw"], 3))
+            ws_c.cell(row=ri, column=10, value=round(row["fb_bulk"], 3))
+            ws_c.cell(row=ri, column=11, value=round(row["fb_interp"], 3))
+            ws_c.cell(row=ri, column=12, value=row["side"])
         _autofit_xl(ws_c)
 
     # -- Layer picks sheet -------------------------------------------------
@@ -3291,6 +3952,8 @@ def export_tx_plot(profile_name: str, shots_info: list,
 def process_profile(profile_name: str, pick_mode: bool = True,
                     geom_override: int | None = None,
                     perp_by_shot_override: dict | None = None,
+                    inline_shift_by_shot_override: dict | None = None,
+                    perp_excel_cfg: dict | None = None,
                     enable_layer_pick: bool = True):
     cfg = PROFILES.get(profile_name)
     if cfg is None:
@@ -3303,10 +3966,31 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         print(f"[ERROR] Data folder not found: {data_dir}")
         return
 
-    geom_type      = int(geom_override) if geom_override is not None else int(cfg["geom"])
+    inferred_geom: int | None = None
+    if geom_override is None and perp_excel_cfg and perp_excel_cfg.get("path"):
+        try:
+            inferred_geom = infer_geometry_from_field_report(
+                path=Path(perp_excel_cfg.get("path")),
+                profile_name=profile_name,
+                sheet_name=perp_excel_cfg.get("sheet"),
+            )
+        except Exception as exc:
+            print(f"  [WARN] Geometry inference from field report failed: {exc}")
+
+    if geom_override is not None:
+        geom_type = int(geom_override)
+        geom_src = "CLI"
+    elif inferred_geom in (100, 200):
+        geom_type = int(inferred_geom)
+        geom_src = "field-report"
+    else:
+        geom_type = 200
+        geom_src = "default"
+
     perp_cfg       = cfg.get("perp_m", 0.0)
     perp_m         = float(perp_cfg if not isinstance(perp_cfg, dict) else 0.0)
     recv_positions = load_geometry(geom_type)
+    print(f"  Geometry selected: {geom_type} m ({geom_src})")
 
     # Resolve shot positions: "auto" derives them from geometry
     shots_cfg = cfg.get("shots", "auto")
@@ -3484,6 +4168,38 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         shot_id = int(shot["shot_id"])
         shots_meta.append((shot_id, float(shot["shot_pos_m"]), float(shot["shot_pos_nominal"])))
 
+    excel_perp_by_shot: dict = {}
+    excel_shift_by_shot: dict = {}
+    if perp_excel_cfg and perp_excel_cfg.get("path"):
+        try:
+            ffid_by_shot = {
+                int(s["shot_id"]): int(s.get("ffid_hdr", 0) or 0)
+                for s in shot_cache
+            }
+            excel_perp_by_shot, excel_shift_by_shot = load_profile_offsets_from_excel(
+                path=Path(perp_excel_cfg.get("path")),
+                profile_name=profile_name,
+                ffid_by_shot=ffid_by_shot,
+                sheet_name=perp_excel_cfg.get("sheet"),
+                ffid_col=str(perp_excel_cfg.get("ffid_col", "A")),
+                perp_col=str(perp_excel_cfg.get("perp_col", "D")),
+                profile_col=str(perp_excel_cfg.get("profile_col", "F")),
+                inline_shift_col=perp_excel_cfg.get("inline_shift_col"),
+            )
+            if excel_perp_by_shot:
+                print("  Excel defaults loaded for PO: "
+                      + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(excel_perp_by_shot.items())))
+            if excel_shift_by_shot:
+                print("  Excel defaults loaded for X-shift: "
+                      + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(excel_shift_by_shot.items())))
+        except Exception as exc:
+            print(f"  [WARN] Could not load PO Excel defaults: {exc}")
+
+    perp_effective = dict(excel_perp_by_shot)
+    perp_effective.update(perp_by_shot_override or {})
+    shift_effective = dict(excel_shift_by_shot)
+    shift_effective.update(inline_shift_by_shot_override or {})
+
     total_picks = sum(len(v) for v in all_picks.values())
     if total_picks == 0:
         print("\n  No picks to export.")
@@ -3508,7 +4224,8 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         shot_label_pos=shot_label_pos,
         all_picks=all_picks,
         recv_positions=recv_positions,
-        perp_override=perp_by_shot_override,
+        perp_override=perp_effective,
+        inline_shift_override=shift_effective,
         enable_layer_pick=enable_layer_pick,
         existing_layer_results=existing_layer_results,
     )
@@ -3575,13 +4292,29 @@ def main():
     parser.add_argument("profile", nargs="?", default=None,
                         help="Profile folder name (e.g. 120 or 214_A)")
     parser.add_argument("geometry", nargs="?", default=None,
-                        help="Optional geometry override: 100, 200, geometry100, geometry200")
+                        help="Legacy geometry override (positional): 100, 200, geometry100, geometry200")
+    parser.add_argument("--geom", default=None,
+                        help="Geometry override: 100, 200, geometry100, geometry200")
     parser.add_argument("--all", action="store_true",
                         help="Process all profiles in PROFILES")
     parser.add_argument("--export-only", action="store_true",
                         help="Skip picking; re-analyse and re-export existing picks")
     parser.add_argument("--perp-by-shot", default=None,
                         help="Override perpendicular offset per shot, e.g. 1:0,2:3.5,3:0")
+    parser.add_argument("--inline-shift-by-shot", default=None,
+                        help="Optional inline shift per shot (m), e.g. 1:50,2:0,3:50")
+    parser.add_argument("--perp-excel", default=None,
+                        help="Excel file with FFID/profile/perpendicular offsets defaults")
+    parser.add_argument("--perp-sheet", default=None,
+                        help="Excel sheet name/index for --perp-excel (default: first sheet)")
+    parser.add_argument("--perp-col-ffid", default="A",
+                        help="Excel column for FFID (default: A)")
+    parser.add_argument("--perp-col-perp", default="D",
+                        help="Excel column for perpendicular offset (default: D)")
+    parser.add_argument("--perp-col-profile", default="F",
+                        help="Excel column for profile token, e.g. LVL150 (default: F)")
+    parser.add_argument("--perp-col-inline-shift", default=None,
+                        help="Optional Excel column for inline X-shift in meters")
     parser.add_argument("--no-layer-pick", action="store_true",
                         help="Skip interactive x0..x5 layer-window picking")
     args = parser.parse_args()
@@ -3592,9 +4325,16 @@ def main():
         print(f"[ERROR] Invalid --perp-by-shot value: {exc}")
         return
 
+    try:
+        inline_shift_override = parse_shot_value_map(args.inline_shift_by_shot)
+    except Exception as exc:
+        print(f"[ERROR] Invalid --inline-shift-by-shot value: {exc}")
+        return
+
     geom_override: int | None = None
-    if args.geometry is not None:
-        g = str(args.geometry).strip().lower().replace(" ", "")
+    geom_raw = args.geom if args.geom is not None else args.geometry
+    if geom_raw is not None:
+        g = str(geom_raw).strip().lower().replace(" ", "")
         if g in ("100", "geometry100"):
             geom_override = 100
         elif g in ("200", "geometry200"):
@@ -3605,6 +4345,34 @@ def main():
             return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    perp_excel_cfg = None
+    if args.perp_excel:
+        sheet_val: str | int | None = args.perp_sheet
+        if sheet_val is not None:
+            s_try = str(sheet_val).strip()
+            if s_try.isdigit():
+                sheet_val = int(s_try)
+        perp_excel_cfg = {
+            "path": args.perp_excel,
+            "sheet": sheet_val,
+            "ffid_col": args.perp_col_ffid,
+            "perp_col": args.perp_col_perp,
+            "profile_col": args.perp_col_profile,
+            "inline_shift_col": args.perp_col_inline_shift,
+        }
+    else:
+        auto_excel = discover_field_report_excel(DATA_DIR)
+        if auto_excel is not None:
+            perp_excel_cfg = {
+                "path": str(auto_excel),
+                "sheet": None,
+                "ffid_col": args.perp_col_ffid,
+                "perp_col": args.perp_col_perp,
+                "profile_col": args.perp_col_profile,
+                "inline_shift_col": args.perp_col_inline_shift,
+            }
+            print(f"  Auto field report detected: {auto_excel.relative_to(CWD.parent)}")
 
     if args.all:
         targets = list(PROFILES)
@@ -3650,6 +4418,8 @@ def main():
         process_profile(pname, pick_mode=not args.export_only,
                         geom_override=geom_override,
                         perp_by_shot_override=perp_override,
+                        inline_shift_by_shot_override=inline_shift_override,
+                        perp_excel_cfg=perp_excel_cfg,
                         enable_layer_pick=not args.no_layer_pick)
 
     print("\nAll done.")
