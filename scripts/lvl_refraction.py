@@ -69,6 +69,7 @@ import sys
 import argparse
 import json
 import math
+import datetime
 import importlib
 import subprocess
 import tkinter as tk
@@ -111,9 +112,10 @@ import pandas as pd
 # CONFIG  --  edit this section for each project
 # ===========================================================================
 
-CWD        = Path(__file__).parent
-DATA_DIR   = CWD.parent / "data"
-OUTPUT_DIR = CWD.parent / "output"
+CWD        = Path(__file__).resolve().parent
+PROJECT_DIR = CWD.parent
+DATA_DIR   = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "output"
 
 # Geometry files: map trace number -> absolute receiver position (m along profile)
 GEOM_FILES: dict = {
@@ -351,21 +353,297 @@ def _normalize_profile_token(value: Any) -> str:
     return s
 
 
-def discover_field_report_excel(data_dir: Path) -> Path | None:
-    """Find likely field-report Excel files in data directory; return newest match."""
+def discover_field_report_excels(data_dir: Path) -> list:
+    """Find likely field-report Excel files in data directory (newest first)."""
     pats = [
         "field_report*.xls",
         "field_report*.xlsx",
         "fieldreport*.xls",
         "fieldreport*.xlsx",
     ]
-    cand: list = []
+    seen: set[str] = set()
+    out: list = []
     for pat in pats:
-        cand.extend(list(data_dir.glob(pat)))
-    if not cand:
+        for p in data_dir.glob(pat):
+            key = str(p.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return out
+
+
+def discover_profile_folders(data_dir: Path) -> list:
+    """Return all profile folder names under data_dir that contain SEG2 files."""
+    out: list = []
+    for p in sorted(data_dir.iterdir() if data_dir.exists() else []):
+        if not p.is_dir():
+            continue
+        has_seg2 = any(p.glob("*.seg2")) or any(p.glob("*.SEG2"))
+        if has_seg2:
+            out.append(p.name)
+    return out
+
+
+def infer_geometry_from_spread_length(length_m: float) -> int | None:
+    """Infer geometry type (100/200) from observed spread length in meters."""
+    try:
+        obs = float(length_m)
+    except Exception:
         return None
-    cand_sorted = sorted(cand, key=lambda p: p.stat().st_mtime, reverse=True)
-    return cand_sorted[0]
+    if not np.isfinite(obs) or obs <= 0.0:
+        return None
+
+    refs = {
+        100: float(abs(load_geometry(100)[-1] - load_geometry(100)[0])),
+        200: float(abs(load_geometry(200)[-1] - load_geometry(200)[0])),
+    }
+    best_geom = min(refs, key=lambda g: abs(obs - refs[g]))
+    rel_err = abs(obs - refs[best_geom]) / max(refs[best_geom], 1e-6)
+    if rel_err <= 0.15:
+        return int(best_geom)
+    return None
+
+
+def infer_geometry_from_seg2_file(seg2_path: Path) -> tuple[int | None, float | None]:
+    """Infer geometry from SEG2 receiver locations in one shot file."""
+    try:
+        _data, _dt, _ntr, _ns, _sp, _ffid, _delay, recv_locs_m = read_seg2(seg2_path)
+    except Exception:
+        return None, None
+    if recv_locs_m is None or len(recv_locs_m) < 2:
+        return None, None
+    length_m = float(abs(float(np.max(recv_locs_m)) - float(np.min(recv_locs_m))))
+    geom = infer_geometry_from_spread_length(length_m)
+    return geom, length_m
+
+
+def _find_station_xyz_columns(df: Any) -> tuple | None:
+    """Detect header row and columns for profile/station/X/Y/Z in a free-form table."""
+    if df is None or df.empty:
+        return None
+
+    def _norm(v: Any) -> str:
+        s = str(v or "").strip().lower().replace("_", " ").replace("-", " ")
+        return " ".join(s.split())
+
+    max_scan = min(30, int(df.shape[0]))
+    for ridx in range(max_scan):
+        row = [_norm(v) for v in df.iloc[ridx].tolist()]
+
+        i_profile = None
+        i_station = None
+        i_x = None
+        i_y = None
+        i_z = None
+
+        for ci, txt in enumerate(row):
+            if not txt:
+                continue
+            if i_profile is None and (("lvl" in txt and "number" in txt) or txt in ("lvl", "profile", "line")):
+                i_profile = ci
+            if i_station is None and "station" in txt:
+                i_station = ci
+            if i_x is None and txt in ("x", "east", "easting"):
+                i_x = ci
+            if i_y is None and txt in ("y", "north", "northing"):
+                i_y = ci
+            if i_z is None and (txt == "z" or "height" in txt or "elevation" in txt):
+                i_z = ci
+
+        if None not in (i_profile, i_station, i_x, i_y, i_z):
+            return ridx, i_profile, i_station, i_x, i_y, i_z
+    return None
+
+
+def _to_float_or_none(v: Any) -> float | None:
+    """Convert numeric-like cell values to float, else None."""
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    s = str(v).strip().replace(",", ".")
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def load_midpoint_xyz_from_geometry_excels(profile_name: str,
+                                           station_mid: float,
+                                           excel_paths: list) -> tuple:
+    """
+    Read midpoint X/Y/Z from LVL geometry spreadsheets.
+
+    Repeated station entries are resolved by taking the last matching row.
+    Returns (x, y, z, source_file) where each value may be None.
+    """
+    target = _normalize_profile_token(profile_name)
+    best_xyz = (None, None, None)
+    best_file = None
+    best_dist = float("inf")
+
+    for path in excel_paths:
+        try:
+            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+        except Exception:
+            continue
+        for _sheet_name, df in sheets.items():
+            cols = _find_station_xyz_columns(df)
+            if cols is None:
+                continue
+            hdr_row, i_prof, i_sta, i_x, i_y, i_z = cols
+
+            by_station: dict = {}
+            for ridx in range(hdr_row + 1, int(df.shape[0])):
+                p_raw = df.iat[ridx, i_prof] if i_prof < df.shape[1] else None
+                s_raw = df.iat[ridx, i_sta] if i_sta < df.shape[1] else None
+                x_raw = df.iat[ridx, i_x] if i_x < df.shape[1] else None
+                y_raw = df.iat[ridx, i_y] if i_y < df.shape[1] else None
+                z_raw = df.iat[ridx, i_z] if i_z < df.shape[1] else None
+
+                if _normalize_profile_token(p_raw) != target:
+                    continue
+                sta = _to_float_or_none(s_raw)
+                x = _to_float_or_none(x_raw)
+                y = _to_float_or_none(y_raw)
+                z = _to_float_or_none(z_raw)
+                if sta is None or x is None or y is None or z is None:
+                    continue
+
+                # Last row wins for repeated station values.
+                by_station[float(sta)] = (float(x), float(y), float(z))
+
+            if not by_station:
+                continue
+
+            for sta, xyz in by_station.items():
+                dist = abs(float(sta) - float(station_mid))
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_xyz = xyz
+                    best_file = path
+
+    return best_xyz[0], best_xyz[1], best_xyz[2], best_file
+
+
+def export_velocity_summary_excel(profile_name: str,
+                                  cfg: dict,
+                                  recv_positions: Any,
+                                  shots_info: list,
+                                  layer_results: dict,
+                                  analysis: dict,
+                                  output_dir: Path,
+                                  geometry_excel_paths: list | None = None,
+                                  filename: str = "LVL_velocity_summary.xlsx") -> Path:
+    """Write/append one profile row to a consolidated velocity summary workbook."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / filename
+    if out_path.exists():
+        wb = openpyxl.load_workbook(str(out_path))
+        ws = wb.active
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Summary"
+        headers = [
+            "Line", "Length_m", "X", "Y", "Z_Ortho_m",
+            "V0L", "V0M", "V0R", "V0A",
+            "V1L", "V1M", "V1R", "V1A",
+            "t1_ms", "D1_m",
+            "V2L", "V2M", "V2R", "V2A",
+            "t2_ms", "D2_m", "D1_plus_D2_m",
+        ]
+        for ci, h in enumerate(headers, start=1):
+            _chdr(ws, 1, ci, h)
+
+    shot_pos_by_id = {int(sid): float(pos) for sid, pos in shots_info}
+    shot_ids = sorted(shot_pos_by_id, key=lambda sid: shot_pos_by_id[sid])
+    sid_l = shot_ids[0] if shot_ids else None
+    sid_m = shot_ids[len(shot_ids) // 2] if shot_ids else None
+    sid_r = shot_ids[-1] if shot_ids else None
+
+    def _get_v(shot_id: int | None, key: str) -> float:
+        if shot_id is None:
+            return 0.0
+        per_side = (layer_results or {}).get(int(shot_id), {}) or {}
+        _, fit = _choose_shot_fit(per_side)
+        if not fit:
+            return 0.0
+        return float((fit or {}).get(key, 0.0) or 0.0)
+
+    avg = compute_layer_averages(layer_results or {}, shot_pos_by_id)
+    v0a = float((avg.get("V0", {}) or {}).get("avg", 0.0) or 0.0)
+    v1a = float((avg.get("V1", {}) or {}).get("avg", 0.0) or 0.0)
+    v2a = float((avg.get("V2", {}) or {}).get("avg", 0.0) or 0.0)
+    t1 = float((avg.get("ti1_ms", {}) or {}).get("avg", 0.0) or 0.0)
+    t2 = float((avg.get("ti2_ms", {}) or {}).get("avg", 0.0) or 0.0)
+    d1 = float(avg.get("h1_m", 0.0) or 0.0)
+    d2 = float(avg.get("h2_m", 0.0) or 0.0)
+
+    line_val = cfg.get("line_no", profile_name)
+    length_m = float(abs(float(recv_positions[-1]) - float(recv_positions[0]))) if len(recv_positions) >= 2 else 0.0
+    station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
+    x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
+        profile_name,
+        station_mid=station_mid,
+        excel_paths=(geometry_excel_paths or []),
+    )
+    if src is not None:
+        print(f"  Midpoint XYZ loaded from: {src.relative_to(CWD.parent)}")
+
+    row = [
+        line_val,
+        round(length_m, 3),
+        x_mid if x_mid is not None else "",
+        y_mid if y_mid is not None else "",
+        z_mid if z_mid is not None else "",
+        round(_get_v(sid_l, "V0_m_s"), 3),
+        round(_get_v(sid_m, "V0_m_s"), 3),
+        round(_get_v(sid_r, "V0_m_s"), 3),
+        round(v0a, 3),
+        round(_get_v(sid_l, "V1_m_s"), 3),
+        round(_get_v(sid_m, "V1_m_s"), 3),
+        round(_get_v(sid_r, "V1_m_s"), 3),
+        round(v1a, 3),
+        round(t1, 3),
+        round(d1, 3),
+        round(_get_v(sid_l, "V2_m_s"), 3),
+        round(_get_v(sid_m, "V2_m_s"), 3),
+        round(_get_v(sid_r, "V2_m_s"), 3),
+        round(v2a, 3),
+        round(t2, 3),
+        round(d2, 3),
+        round(d1 + d2, 3),
+    ]
+
+    profile_col = 1
+    target_row = None
+    for rr in range(2, ws.max_row + 1):
+        val = ws.cell(row=rr, column=profile_col).value
+        if str(val).strip() == str(line_val).strip():
+            target_row = rr
+    if target_row is None:
+        target_row = ws.max_row + 1
+
+    for ci, vv in enumerate(row, start=1):
+        ws.cell(row=target_row, column=ci, value=vv)
+
+    _autofit_xl(ws)
+    try:
+        wb.save(str(out_path))
+        print(f"  Velocity summary -> {out_path.relative_to(CWD.parent)}")
+        return out_path
+    except PermissionError:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt = out_path.with_name(f"{out_path.stem}_{stamp}{out_path.suffix}")
+        wb.save(str(alt))
+        print(f"  [WARN] Summary file locked; wrote fallback -> {alt.relative_to(CWD.parent)}")
+        return alt
 
 
 def _read_excel_table(path: Path, sheet_name: str | int | None = None) -> Any:
@@ -735,7 +1013,7 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
         sp.set_edgecolor(c["spine"])
     ax_prev.grid(True, lw=0.3, alpha=0.30, color=c["grid"])
     ax_prev.tick_params(colors=c["tick"])
-    ax_prev.set_xlabel("True offset (m)", color=c["label"], fontsize=8)
+    ax_prev.set_xlabel("Signed inline x (m, +right / -left)", color=c["label"], fontsize=8)
     ax_prev.set_ylabel("FB time (ms)", color=c["label"], fontsize=8)
     ax_prev.set_title("Live preview: all shots", color=c["text"], fontsize=9)
 
@@ -764,7 +1042,7 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
         ax_prev.set_facecolor(c["ax_bg"])
         ax_prev.grid(True, lw=0.3, alpha=0.30, color=c["grid"])
         ax_prev.tick_params(colors=c["tick"])
-        ax_prev.set_xlabel("True offset (m)", color=c["label"], fontsize=8)
+        ax_prev.set_xlabel("Signed inline x (m, +right / -left)", color=c["label"], fontsize=8)
         ax_prev.set_ylabel("FB time (ms)", color=c["label"], fontsize=8)
         ax_prev.set_title("Live preview: all shots", color=c["text"], fontsize=9)
 
@@ -790,9 +1068,10 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
                 if tr >= len(recv_positions):
                     continue
                 inline_abs = abs(float(recv_positions[tr]) - float(shot_pos))
+                inline_signed = float(recv_positions[tr]) - float(shot_pos)
                 inline_corr = max(0.0, inline_abs + x_shift)
-                x_true = float(true_offset(inline_corr, po))
-                xvals.append(x_true)
+                x_signed = float(np.sign(inline_signed) * inline_corr)
+                xvals.append(x_signed)
                 tvals.append(float(picks[tr]))
             if len(xvals) < 2:
                 continue
@@ -1261,6 +1540,27 @@ def apply_gain(data: Any, dt_s: float,
                mode: str = GAIN_MODE,
                window_ms: float = AGC_WINDOW_MS,
                stat: str = AGC_STAT) -> Any:
+    """
+    Apply display-time amplitude normalization per trace.
+
+    Parameters
+    ----------
+    data : Any
+        Trace matrix with shape (n_traces, n_samples).
+    dt_s : float
+        Sample interval in seconds.
+    mode : str, optional
+        Gain mode: "none", "norm", or "agc".
+    window_ms : float, optional
+        AGC moving window length in milliseconds.
+    stat : str, optional
+        AGC statistic: "rms" (default) or "mean".
+
+    Returns
+    -------
+    Any
+        Gain-adjusted trace matrix as float32.
+    """
     mode_l = str(mode).lower()
     out = np.asarray(data, dtype=np.float32).copy()
 
@@ -1531,7 +1831,24 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
 
 
 def _fit_layers_from_windows(x_vals: Any, t_vals: Any, windows: list) -> dict:
-    """Fit up to 3 linear layers from user-selected x-windows."""
+    """
+    Fit up to three travel-time line segments from picked x-windows.
+
+    Parameters
+    ----------
+    x_vals : Any
+        Corrected true offsets (m).
+    t_vals : Any
+        Corrected first-break times (ms).
+    windows : list
+        Layer windows as [(x1, x2), (x3, x4), (x5, x6)] where each entry
+        may be None if a layer was not selected.
+
+    Returns
+    -------
+    dict
+        Fitted segment metrics plus derived velocities/intercept times/depths.
+    """
     x = np.asarray(x_vals, dtype=float)
     t = np.asarray(t_vals, dtype=float)
 
@@ -1628,12 +1945,60 @@ def _compute_fit_rms(x_vals: Any, t_vals: Any, fit_res: dict) -> float:
     return float(np.sqrt(np.mean((oa - pa) ** 2)))
 
 
+def _recompute_fit_derived(fit_res: dict) -> dict:
+    """Recompute V/ti/depth summary fields after manual segment edits."""
+    segs = list((fit_res or {}).get("segments", []) or [])
+    segs += [{}, {}, {}]
+    segs = segs[:3]
+
+    v0 = float(segs[0].get("velocity_m_s", 0.0) or 0.0)
+    v1 = float(segs[1].get("velocity_m_s", 0.0) or 0.0)
+    v2 = float(segs[2].get("velocity_m_s", 0.0) or 0.0)
+    ti1 = float(segs[1].get("intercept_ms", 0.0) or 0.0) if v1 > 0.0 else 0.0
+    ti2 = float(segs[2].get("intercept_ms", 0.0) or 0.0) if v2 > 0.0 else 0.0
+
+    h1 = depth_2layer(ti1, v0, v1) if (v0 > 0.0 and v1 > 0.0 and ti1 > 0.0) else None
+    h2 = depth_3layer(ti2, v0, v1, v2, h1) if (h1 and v2 > 0.0 and ti2 > 0.0) else None
+
+    fit_res["segments"] = segs
+    fit_res["V0_m_s"] = v0
+    fit_res["V1_m_s"] = v1
+    fit_res["V2_m_s"] = v2
+    fit_res["ti1_ms"] = ti1
+    fit_res["ti2_ms"] = ti2
+    fit_res["h1_m"] = float(h1) if h1 else 0.0
+    fit_res["h2_m"] = float(h2) if h2 else 0.0
+    return fit_res
+
+
+def _drop_fit_layer(fit_res: dict, layer_idx: int) -> dict:
+    """Disable one fitted layer (0-based index) and recompute summaries."""
+    segs = list((fit_res or {}).get("segments", []) or [])
+    while len(segs) < 3:
+        segs.append({})
+    i = int(layer_idx)
+    if 0 <= i < 3:
+        seg = dict(segs[i])
+        seg["velocity_m_s"] = 0.0
+        seg["intercept_ms"] = 0.0
+        seg["slope_ms_m"] = 0.0
+        seg["r2"] = 0.0
+        segs[i] = seg
+        wins = list((fit_res or {}).get("windows", []) or [])
+        while len(wins) < 3:
+            wins.append(None)
+        wins[i] = None
+        fit_res["windows"] = wins[:3]
+        fit_res["segments"] = segs[:3]
+    return _recompute_fit_derived(fit_res)
+
+
 def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
                                   fit_res: dict, title: str) -> str:
     """
     Review layer fit and choose action.
 
-    Returns one of: "accept", "repick", "skip".
+    Returns one of: "accept", "repick", "skip", "drop1", "drop2", "drop3".
     """
     try:
         backend = str(plt.get_backend()).lower()
@@ -1736,19 +2101,26 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
                "Fit review\n\n"
                "Accept: keep this fit\n"
                "Repick: choose windows again\n"
-               "Skip: use previous/empty\n\n"
-               "Keys: Enter=Accept, r=Repick, Esc=Skip",
+               "Skip: use previous/empty\n"
+               "Drop L1/L2/L3: ignore one layer\n\n"
+               "Keys: Enter=Accept, r=Repick, 1/2/3=Drop, Esc=Skip",
                transform=panel.transAxes, va="top", ha="left",
                fontsize=8, color=c["text"])
 
-    ax_acc = fig.add_axes([0.84, 0.20, 0.14, 0.06])
-    ax_rep = fig.add_axes([0.84, 0.12, 0.14, 0.06])
-    ax_skp = fig.add_axes([0.84, 0.04, 0.14, 0.06])
+    ax_acc = fig.add_axes([0.84, 0.24, 0.14, 0.06])
+    ax_rep = fig.add_axes([0.84, 0.17, 0.14, 0.06])
+    ax_d1 = fig.add_axes([0.84, 0.10, 0.045, 0.06])
+    ax_d2 = fig.add_axes([0.8875, 0.10, 0.045, 0.06])
+    ax_d3 = fig.add_axes([0.935, 0.10, 0.045, 0.06])
+    ax_skp = fig.add_axes([0.84, 0.03, 0.14, 0.06])
     hover = "#e8e8e8" if THEME == "light" else "#2a2d3d"
     b_acc = Button(ax_acc, "Accept", color=c["ax_bg"], hovercolor=hover)
     b_rep = Button(ax_rep, "Repick", color=c["ax_bg"], hovercolor=hover)
+    b_d1 = Button(ax_d1, "L1", color=c["ax_bg"], hovercolor=hover)
+    b_d2 = Button(ax_d2, "L2", color=c["ax_bg"], hovercolor=hover)
+    b_d3 = Button(ax_d3, "L3", color=c["ax_bg"], hovercolor=hover)
     b_skp = Button(ax_skp, "Skip", color=c["ax_bg"], hovercolor=hover)
-    for b in (b_acc, b_rep, b_skp):
+    for b in (b_acc, b_rep, b_d1, b_d2, b_d3, b_skp):
         b.label.set_color(c["text"])
         b.label.set_fontsize(8)
         for sp in b.ax.spines.values():
@@ -1768,6 +2140,9 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
 
     b_acc.on_clicked(lambda _e: _finish("accept"))
     b_rep.on_clicked(lambda _e: _finish("repick"))
+    b_d1.on_clicked(lambda _e: _finish("drop1"))
+    b_d2.on_clicked(lambda _e: _finish("drop2"))
+    b_d3.on_clicked(lambda _e: _finish("drop3"))
     b_skp.on_clicked(lambda _e: _finish("skip"))
 
     def _on_key(evt: Any):
@@ -1775,6 +2150,12 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
             _finish("accept")
         elif evt.key in ("r", "R"):
             _finish("repick")
+        elif evt.key == "1":
+            _finish("drop1")
+        elif evt.key == "2":
+            _finish("drop2")
+        elif evt.key == "3":
+            _finish("drop3")
         elif evt.key in ("escape", "q"):
             _finish("skip")
 
@@ -1802,7 +2183,22 @@ def pick_layer_windows_interactive(profile_name: str,
                                    existing_results: dict | None = None) -> dict:
     """
     Interactive layer picking for each shot side (L/R).
-    Returns {shot_id: {"L": fit_result, "R": fit_result}}.
+
+    Parameters
+    ----------
+    profile_name : str
+        Profile identifier used in plot titles.
+    corrected_by_shot : dict
+        Output of build_corrected_pick_data(), keyed by shot id.
+    existing_results : dict | None, optional
+        Previously saved layer picks. If a side is skipped, previous values
+        can be kept from this mapping.
+
+    Returns
+    -------
+    dict
+        Layer fit payload by shot and side:
+        {shot_id: {"L"|"R"|"ALL": fit_result}}.
     """
     existing = existing_results or {}
     results: dict = {}
@@ -1872,6 +2268,12 @@ def pick_layer_windows_interactive(profile_name: str,
                 choice = _review_layer_fit_interactive(x, t, fit_res, title)
                 if choice == "repick":
                     print(f"     Shot {shot_id} Side {side}: re-pick requested.")
+                    continue
+                if choice in ("drop1", "drop2", "drop3"):
+                    drop_idx = {"drop1": 0, "drop2": 1, "drop3": 2}[choice]
+                    fit_res = _drop_fit_layer(fit_res, drop_idx)
+                    fit_res["rms_ms"] = _compute_fit_rms(x, t, fit_res)
+                    print(f"     Shot {shot_id} Side {side}: dropped layer {drop_idx + 1} and reviewing again.")
                     continue
                 if choice == "skip":
                     prev = ((existing.get(int(shot_id), {}) or {}).get(side))
@@ -1995,7 +2397,13 @@ def _predict_time_from_fit(x_abs: float, fit_res: dict) -> float | None:
 
 
 def _choose_shot_fit(layer_by_side: dict) -> tuple[str | None, dict | None]:
-    """Choose one representative fit per shot for summary export."""
+    """
+    Choose one representative side-fit per shot for summary export.
+
+    Priority is:
+    1) "ALL" side if present,
+    2) side with the largest number of fitted points.
+    """
     if not layer_by_side:
         return None, None
     if "ALL" in layer_by_side:
@@ -2026,6 +2434,18 @@ def build_analysis_from_layers(corrected_by_shot: dict,
         "n_fit": int,
         "fit_side": "L"|"R"|"ALL"
       }
+
+    Parameters
+    ----------
+    corrected_by_shot : dict
+        Corrected pick rows produced by build_corrected_pick_data().
+    layer_results : dict
+        Interactive fit results per shot/side.
+
+    Returns
+    -------
+    dict
+        Compact per-shot analysis payload used by Excel and QC exports.
     """
     out: dict = {}
     for shot_id, rows in (corrected_by_shot or {}).items():
@@ -2172,7 +2592,8 @@ def export_fit_plot(profile_name: str,
     if handles:
         ax.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
                   labelcolor=c["text"], loc="best")
-    fig.tight_layout()
+    # tight_layout emits warnings with dense title/legend combinations.
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.12, top=0.92)
 
     out_dir = OUTPUT_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2191,13 +2612,10 @@ def export_corrected_qc_plot(profile_name: str,
                              show_plot: bool = False) -> Path:
     """QC visualization for corrected picks and true-offset mapping."""
     c = _tc()
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5), sharey=False)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), sharey=False)
     fig.patch.set_facecolor(c["fig_bg"])
     ax1.set_facecolor(c["ax_bg"])
     ax2.set_facecolor(c["ax_bg"])
-    ax3.set_facecolor(c["ax_bg"])
-    ax3_top = ax3.twiny()
-    ax3_top.set_facecolor("none")
 
     pal = ["#e63946", "#2a9d8f", "#e9c46a", "#457b9d", "#f4a261", "#8d99ae"]
 
@@ -2215,10 +2633,6 @@ def export_corrected_qc_plot(profile_name: str,
                  label=f"Shot {shot_id} (@{label_pos:.1f} m)")
 
         ax2.plot(x_geom, t_interp, "o-", ms=3, lw=1.0, color=col, alpha=0.9)
-
-        ax3.plot(tr, t_interp, "o-", ms=3, lw=1.0, color=col, alpha=0.9,
-                 label=f"Shot {shot_id}")
-        ax3_top.plot(x_geom, t_interp, "--", lw=0.9, color=col, alpha=0.7)
 
     # Secondary top axis on geometry-x panel: channels
     sample_rows: list = []
@@ -2253,26 +2667,16 @@ def export_corrected_qc_plot(profile_name: str,
     ax2.set_xlabel("Geometry x (m)", color=c["label"])
     ax2.set_title("Interpolated FB vs geometry x", color=c["text"], fontsize=10)
 
-    ax3.set_xlabel("Channel", color=c["label"])
-    ax3_top.set_xlabel("Geometry x (m)", color=c["label"], fontsize=8)
-    ax3.set_ylabel("First-break time (ms)", color=c["label"])
-    ax3.set_title("Interpolated FB vs channel / geometry", color=c["text"], fontsize=10)
-
-    for ax in (ax1, ax2, ax3):
+    for ax in (ax1, ax2):
         ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
         ax.tick_params(colors=c["tick"])
         for sp in ax.spines.values():
             sp.set_edgecolor(c["spine"])
 
-    ax3_top.tick_params(colors=c["tick"], labelsize=8)
-    for sp in ax3_top.spines.values():
-        sp.set_edgecolor(c["spine"])
-
     ax1.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
                labelcolor=c["text"])
     ax1.set_ylim(T_MAX_MS, 0.0)
     ax2.set_ylim(T_MAX_MS, 0.0)
-    ax3.set_ylim(T_MAX_MS, 0.0)
 
     if layer_results:
         txt_lines: list = []
@@ -3314,6 +3718,7 @@ def _layer_session_json_path(profile_name: str) -> Path:
 
 
 def _coerce_layer_results(raw: dict) -> dict:
+    """Normalize JSON-loaded layer results into int-shot keyed dict form."""
     out: dict = {}
     for sid, side_map in (raw or {}).items():
         try:
@@ -3354,6 +3759,7 @@ def load_layer_session_json(profile_name: str) -> dict:
 
 
 def save_layer_json(profile_name: str, layer_results: dict):
+    """Persist final layer analysis results to layer_analysis.json."""
     p = _layer_json_path(profile_name)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as fh:
@@ -3362,6 +3768,7 @@ def save_layer_json(profile_name: str, layer_results: dict):
 
 
 def save_layer_session_json(profile_name: str, layer_results: dict):
+    """Persist in-progress layer analysis to layer_analysis.session.json."""
     p = _layer_session_json_path(profile_name)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as fh:
@@ -3410,6 +3817,7 @@ def load_session_picks_json(profile_name: str) -> dict:
 
 
 def save_picks_json(profile_name: str, all_picks: dict):
+    """Persist finalized raw picks to picks.json."""
     p = _picks_json_path(profile_name)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as fh:
@@ -3420,6 +3828,7 @@ def save_picks_json(profile_name: str, all_picks: dict):
 
 
 def save_session_picks_json(profile_name: str, all_picks: dict):
+    """Persist in-progress raw picks to picks.session.json."""
     p = _session_picks_json_path(profile_name)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as fh:
@@ -3866,7 +4275,9 @@ def export_excel(profile_name: str, shots_info: list,
 def export_tx_plot(profile_name: str, shots_info: list,
                    all_picks: dict, recv_positions: Any,
                    analysis: dict, perp_m: float = 0.0,
-                   shot_label_pos: dict | None = None) -> Path:
+                   shot_label_pos: dict | None = None,
+                   corrected_by_shot: dict | None = None,
+                   layer_results: dict | None = None) -> Path:
     """
     Final T-X summary plot.
     - Scatter of corrected picks (absolute true offset vs corrected pick time)
@@ -3875,9 +4286,10 @@ def export_tx_plot(profile_name: str, shots_info: list,
     - Theme follows the current THEME setting at export time
     """
     c = _tc()
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, (ax_ch, ax_tx) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=False)
     fig.patch.set_facecolor(c["fig_bg"])
-    ax.set_facecolor(c["ax_bg"])
+    ax_ch.set_facecolor(c["ax_bg"])
+    ax_tx.set_facecolor(c["ax_bg"])
 
     pal = ["#e63946", "#2a9d8f", "#e9c46a", "#a8dadc", "#f4a261", "#457b9d"]
     mks = ["o", "s", "^", "D", "P", "X"]
@@ -3896,44 +4308,126 @@ def export_tx_plot(profile_name: str, shots_info: list,
                 x_geom.append(float(recv_positions[idx]))
                 t_vals.append(corr[idx])
 
-        ax.scatter(x_geom, t_vals, color=col, marker=mk, s=28, zorder=5,
-               label=f"Shot {shot_id}  (@ {label_pos_m:.1f} m)")
+        # Left panel: channel-domain view (QC style)
+        tr = [idx + 1 for idx in sorted(corr) if idx < len(recv_positions)]
+        ax_ch.plot(tr, t_vals, "o-", ms=3, lw=1.0, color=col,
+               label=f"Shot {shot_id} (@ {label_pos_m:.1f} m)")
 
-        # Dashed fitted T-X lines (only when analysis data is available)
-        res = (analysis or {}).get(shot_id)
-        if res and res.get("segments"):
-            for seg in res["segments"]:
-                # Convert segment x-range (absolute offset) back to geometry x
-                # using shot position so lines align with geometry x-axis
-                xg0 = shot_pos_m + float(seg.get("x_start", seg.get("x0", 0.0)))
-                xg1 = shot_pos_m + float(seg.get("x_end", seg.get("x1", 0.0)))
-                sl  = seg["slope_ms_m"]
-                ic  = seg["intercept_ms"]
-                vel = seg["velocity_m_s"]
-                xl  = np.array([xg0, xg1])
-                # Predicted time at geometry x using offset from shot
-                t_line = sl * np.abs(xl - shot_pos_m) + ic
-                ax.plot(xl, t_line, "--", color=col,
-                        lw=1.6, alpha=c["fit_alpha"])
-                xm = (xg0 + xg1) / 2.0
+        # Right panel: geometry T-X view
+        ax_tx.scatter(x_geom, t_vals, color=col, marker=mk, s=28, zorder=5,
+                  label=f"Shot {shot_id} (@ {label_pos_m:.1f} m)")
+
+        # Dashed fitted T-X lines for each available side (L/R/ALL).
+        side_map = (layer_results or {}).get(shot_id, {}) or {}
+        rows_corr = list((corrected_by_shot or {}).get(shot_id, []))
+        ordered_sides = [s for s in ("L", "R", "ALL") if s in side_map]
+        ordered_sides += [s for s in side_map if s not in ordered_sides]
+        for side in ordered_sides:
+            fit_res = side_map.get(side)
+            if not fit_res or not rows_corr:
+                continue
+            if side in ("L", "R"):
+                rows_plot = [r for r in rows_corr if r.get("side") == side]
+                if not rows_plot:
+                    continue
+            else:
+                rows_plot = rows_corr
+
+            x_pred: list = []
+            t_pred: list = []
+            for rr in rows_plot:
+                xg = float(rr.get("recv_pos_m", shot_pos_m))
+                x_abs = float(rr.get("true_off_m", abs(xg - shot_pos_m)))
+                tp = _predict_time_from_fit(x_abs, fit_res)
+                if tp is None:
+                    continue
+                x_pred.append(xg)
+                t_pred.append(float(tp))
+
+            if not x_pred:
+                continue
+
+            order = np.argsort(np.asarray(x_pred, dtype=float))
+            xp = np.asarray(x_pred, dtype=float)[order]
+            tp = np.asarray(t_pred, dtype=float)[order]
+            ls = "--" if side != "R" else ":"
+            ax_tx.plot(xp, tp, ls, color=col, lw=1.6, alpha=c["fit_alpha"])
+
+            segs = list((fit_res or {}).get("segments", []) or [])
+            for seg in segs:
+                vel = float(seg.get("velocity_m_s", 0.0) or 0.0)
+                if vel <= 0.0:
+                    continue
+                sl = float(seg.get("slope_ms_m", 0.0) or 0.0)
+                ic = float(seg.get("intercept_ms", 0.0) or 0.0)
+                if sl <= 0.0:
+                    continue
+                xm = float(np.median(xp))
                 tm = sl * abs(xm - shot_pos_m) + ic
-                ax.text(xm, tm - 3.5,
-                        f"{vel:.0f} m/s", color=col, fontsize=7,
-                        ha="center", fontweight="bold")
+                ax_tx.text(xm, tm - 3.5, f"{side}:{vel:.0f}", color=col,
+                       fontsize=7, ha="center", fontweight="bold")
 
     # Seismic convention: t = 0 at top, time grows downward
-    ax.set_ylim(T_MAX_MS, 0.0)
-    ax.set_xlabel("Receiver position  (m)", color=c["label"])
-    ax.set_ylabel("First-break time  (ms)", color=c["label"])
-    ax.set_title(f"T-X first-break picks  --  Profile {profile_name}",
+    ax_ch.set_ylim(T_MAX_MS, 0.0)
+    ax_tx.set_ylim(T_MAX_MS, 0.0)
+    ax_ch.set_xlabel("Channel", color=c["label"])
+    ax_ch.set_ylabel("First-break time  (ms)", color=c["label"])
+    ax_ch.set_title("Shot picks vs channel", color=c["text"], fontsize=10)
+
+    ax_tx.set_xlabel("Receiver position (m)", color=c["label"])
+    ax_tx.set_ylabel("First-break time  (ms)", color=c["label"])
+    ax_tx.set_title("T-X picks + fitted arrivals", color=c["text"], fontsize=10)
+
+    # Channel ticks on top of T-X panel
+    if len(recv_positions) > 0:
+        ax_tx_top = ax_tx.twiny()
+        ax_tx_top.set_xlim(ax_tx.get_xlim())
+        xs = np.asarray(recv_positions, dtype=float)
+        step = max(1, len(xs) // 10)
+        idxs = list(range(0, len(xs), step))
+        if (len(xs) - 1) not in idxs:
+            idxs.append(len(xs) - 1)
+        ax_tx_top.set_xticks(xs[idxs])
+        ax_tx_top.set_xticklabels([str(i + 1) for i in idxs], fontsize=7)
+        ax_tx_top.set_xlabel("Channel", color=c["label"], fontsize=8)
+        ax_tx_top.tick_params(colors=c["tick"], labelsize=7)
+        for sp in ax_tx_top.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    # Velocity legend text block
+    if layer_results:
+        txt_lines: list = []
+        for sid in sorted(layer_results):
+            side_map = layer_results.get(sid, {}) or {}
+            for side in [s for s in ("L", "R", "ALL") if s in side_map]:
+                lr = side_map.get(side) or {}
+                txt_lines.append(
+                    f"S{sid}-{side}: V0={lr.get('V0_m_s',0):.0f}, "
+                    f"V1={lr.get('V1_m_s',0):.0f}, V2={lr.get('V2_m_s',0):.0f}"
+                )
+        if txt_lines:
+            ax_tx.text(0.01, 0.01, "\n".join(txt_lines[:10]), transform=ax_tx.transAxes,
+                       fontsize=7, color=c["text"], va="bottom", ha="left",
+                       bbox=dict(facecolor=c["ax_bg"], edgecolor=c["spine"], alpha=0.75))
+
+    for ax in (ax_ch, ax_tx):
+        ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+        ax.tick_params(colors=c["tick"])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    handles, labels = ax_ch.get_legend_handles_labels()
+    if handles:
+        ax_ch.legend(fontsize=8, facecolor=c["leg_face"],
+                     edgecolor=c["leg_edge"], labelcolor=c["text"], loc="best")
+    handles2, labels2 = ax_tx.get_legend_handles_labels()
+    if handles2:
+        ax_tx.legend(fontsize=8, facecolor=c["leg_face"],
+                     edgecolor=c["leg_edge"], labelcolor=c["text"], loc="best")
+
+    fig.suptitle(f"Profile {profile_name} - Picks, T-X, and fit overlays",
                  color=c["text"], fontsize=11)
-    ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
-    ax.tick_params(colors=c["tick"])
-    for sp in ax.spines.values():
-        sp.set_edgecolor(c["spine"])
-    ax.legend(fontsize=9, facecolor=c["leg_face"],
-              edgecolor=c["leg_edge"], labelcolor=c["text"])
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.12)
 
     out_dir = OUTPUT_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3955,36 +4449,86 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                     inline_shift_by_shot_override: dict | None = None,
                     perp_excel_cfg: dict | None = None,
                     enable_layer_pick: bool = True):
+    """
+    Run the full profile pipeline: pick, correct, analyze, and export.
+
+    Parameters
+    ----------
+    profile_name : str
+        Profile key from PROFILES (also expected folder name under data/).
+    pick_mode : bool, optional
+        True: open interactive picker. False: export-only mode using saved picks.
+    geom_override : int | None, optional
+        Explicit geometry type (100 or 200) overriding auto/default selection.
+    perp_by_shot_override : dict | None, optional
+        CLI-provided perpendicular offsets by shot id.
+    inline_shift_by_shot_override : dict | None, optional
+        CLI-provided inline shifts (m) by shot id.
+    perp_excel_cfg : dict | None, optional
+        Excel mapping configuration for loading default PO/X-shift values.
+    enable_layer_pick : bool, optional
+        Enable interactive layer-window picking/review stage.
+    """
     cfg = PROFILES.get(profile_name)
     if cfg is None:
-        print(f"[ERROR] Profile '{profile_name}' not in PROFILES. "
-              f"Known: {list(PROFILES)}")
-        return
+        cfg = {
+            "geom": 200,
+            "line_no": profile_name,
+            "perp_m": 0.0,
+            "shots": "auto",
+        }
+        print(f"  [INFO] Profile '{profile_name}' not in PROFILES; using dynamic defaults.")
 
     data_dir = DATA_DIR / profile_name
     if not data_dir.exists():
         print(f"[ERROR] Data folder not found: {data_dir}")
         return
 
+    def _ffid(p: Path) -> int:
+        digits = "".join(c for c in p.stem if c.isdigit())
+        return int(digits) if digits else 0
+
+    seg2_candidates = list(data_dir.glob("*.seg2")) + list(data_dir.glob("*.SEG2"))
+    seg2_unique = {str(p.resolve()).lower(): p for p in seg2_candidates}
+    seg2_files = sorted(seg2_unique.values(), key=_ffid)
+    if not seg2_files:
+        print(f"[ERROR] No .seg2 files found in {data_dir}")
+        return
+    print(f"  Found {len(seg2_files)} SEG2 file(s)")
+
     inferred_geom: int | None = None
-    if geom_override is None and perp_excel_cfg and perp_excel_cfg.get("path"):
-        try:
-            inferred_geom = infer_geometry_from_field_report(
-                path=Path(perp_excel_cfg.get("path")),
-                profile_name=profile_name,
-                sheet_name=perp_excel_cfg.get("sheet"),
-            )
-        except Exception as exc:
-            print(f"  [WARN] Geometry inference from field report failed: {exc}")
+    report_paths = [Path(p) for p in (perp_excel_cfg or {}).get("paths", []) if p]
+    if geom_override is None and report_paths:
+        for rp in report_paths:
+            try:
+                inferred = infer_geometry_from_field_report(
+                    path=rp,
+                    profile_name=profile_name,
+                    sheet_name=(perp_excel_cfg or {}).get("sheet"),
+                )
+            except Exception as exc:
+                print(f"  [WARN] Geometry inference failed in {rp.name}: {exc}")
+                continue
+            if inferred in (100, 200):
+                inferred_geom = int(inferred)
+                print(f"  Geometry hint from field report: {rp.name} -> {inferred_geom} m")
+                break
+
+    geom_from_seg2, seg2_len_m = infer_geometry_from_seg2_file(seg2_files[0])
 
     if geom_override is not None:
         geom_type = int(geom_override)
         geom_src = "CLI"
+    elif geom_from_seg2 in (100, 200):
+        geom_type = int(geom_from_seg2)
+        geom_src = f"SEG2 spread-length ({seg2_len_m:.2f} m)"
     elif inferred_geom in (100, 200):
         geom_type = int(inferred_geom)
         geom_src = "field-report"
     else:
-        geom_type = 200
+        geom_type = int(cfg.get("geom", 200) or 200)
+        if geom_type not in (100, 200):
+            geom_type = 200
         geom_src = "default"
 
     perp_cfg       = cfg.get("perp_m", 0.0)
@@ -4003,18 +4547,6 @@ def process_profile(profile_name: str, pick_mode: bool = True,
             f"{recv_positions[0]:.2f} - {recv_positions[-1]:.2f} m  "
             f"|  perp(default) = {perp_m:.1f} m  "
             f"|  bulk static = {BULK_SHIFT_MS:+.1f} ms")
-
-    def _ffid(p: Path) -> int:
-        digits = "".join(c for c in p.stem if c.isdigit())
-        return int(digits) if digits else 0
-
-    seg2_candidates = list(data_dir.glob("*.seg2")) + list(data_dir.glob("*.SEG2"))
-    seg2_unique = {str(p.resolve()).lower(): p for p in seg2_candidates}
-    seg2_files = sorted(seg2_unique.values(), key=_ffid)
-    if not seg2_files:
-        print(f"[ERROR] No .seg2 files found in {data_dir}")
-        return
-    print(f"  Found {len(seg2_files)} SEG2 file(s)")
 
     final_picks: dict = load_picks_json(profile_name)
     session_picks: dict = load_session_picks_json(profile_name)
@@ -4170,35 +4702,48 @@ def process_profile(profile_name: str, pick_mode: bool = True,
 
     excel_perp_by_shot: dict = {}
     excel_shift_by_shot: dict = {}
-    if perp_excel_cfg and perp_excel_cfg.get("path"):
+    ffid_by_shot = {
+        int(s["shot_id"]): int(s.get("ffid_hdr", 0) or 0)
+        for s in shot_cache
+    }
+    for rp in report_paths:
         try:
-            ffid_by_shot = {
-                int(s["shot_id"]): int(s.get("ffid_hdr", 0) or 0)
-                for s in shot_cache
-            }
-            excel_perp_by_shot, excel_shift_by_shot = load_profile_offsets_from_excel(
-                path=Path(perp_excel_cfg.get("path")),
+            po_map, sh_map = load_profile_offsets_from_excel(
+                path=rp,
                 profile_name=profile_name,
                 ffid_by_shot=ffid_by_shot,
-                sheet_name=perp_excel_cfg.get("sheet"),
-                ffid_col=str(perp_excel_cfg.get("ffid_col", "A")),
-                perp_col=str(perp_excel_cfg.get("perp_col", "D")),
-                profile_col=str(perp_excel_cfg.get("profile_col", "F")),
-                inline_shift_col=perp_excel_cfg.get("inline_shift_col"),
+                sheet_name=(perp_excel_cfg or {}).get("sheet"),
+                ffid_col=str((perp_excel_cfg or {}).get("ffid_col", "A")),
+                perp_col=str((perp_excel_cfg or {}).get("perp_col", "D")),
+                profile_col=str((perp_excel_cfg or {}).get("profile_col", "F")),
+                inline_shift_col=(perp_excel_cfg or {}).get("inline_shift_col"),
             )
-            if excel_perp_by_shot:
-                print("  Excel defaults loaded for PO: "
-                      + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(excel_perp_by_shot.items())))
-            if excel_shift_by_shot:
-                print("  Excel defaults loaded for X-shift: "
-                      + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(excel_shift_by_shot.items())))
         except Exception as exc:
-            print(f"  [WARN] Could not load PO Excel defaults: {exc}")
+            print(f"  [WARN] Could not parse PO defaults from {rp.name}: {exc}")
+            continue
+        if po_map:
+            excel_perp_by_shot.update(po_map)
+            print("  Excel defaults loaded for PO from "
+                  f"{rp.name}: "
+                  + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(po_map.items())))
+        if sh_map:
+            excel_shift_by_shot.update(sh_map)
+            print("  Excel defaults loaded for X-shift from "
+                  f"{rp.name}: "
+                  + ", ".join(f"S{k}={v:.2f}" for k, v in sorted(sh_map.items())))
 
     perp_effective = dict(excel_perp_by_shot)
     perp_effective.update(perp_by_shot_override or {})
     shift_effective = dict(excel_shift_by_shot)
     shift_effective.update(inline_shift_by_shot_override or {})
+
+    if not perp_effective:
+        print("\n  [WARN] No perpendicular offsets found in field reports.")
+        print("         Opening geometry editor with default PO=0.0 for all shots.")
+    for s in shot_cache:
+        sid = int(s["shot_id"])
+        perp_effective.setdefault(sid, 0.0)
+        shift_effective.setdefault(sid, 0.0)
 
     total_picks = sum(len(v) for v in all_picks.values())
     if total_picks == 0:
@@ -4251,7 +4796,8 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                      perp_by_shot=perp_by_shot,
                      filename_suffix="_preview")
         export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
-                       analysis, perp_m=perp_m, shot_label_pos=shot_label_pos)
+                       analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
+                       corrected_by_shot=corrected_by_shot, layer_results=layer_results)
         export_fit_plot(profile_name, corrected_by_shot, layer_results,
                         filename_suffix="_preview")
         print("  Preview files written; final picks.json not updated.")
@@ -4264,8 +4810,21 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                  layer_results=layer_results,
                  perp_by_shot=perp_by_shot)
     export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
-                   analysis, perp_m=perp_m, shot_label_pos=shot_label_pos)
+                   analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
+                   corrected_by_shot=corrected_by_shot, layer_results=layer_results)
     export_fit_plot(profile_name, corrected_by_shot, layer_results)
+    export_arrivals_observed_computed_plot(profile_name, corrected_by_shot, layer_results)
+    geometry_excels = [Path(p) for p in (perp_excel_cfg or {}).get("geometry_paths", []) if p]
+    export_velocity_summary_excel(
+        profile_name=profile_name,
+        cfg=cfg,
+        recv_positions=recv_positions,
+        shots_info=shots_info_proc,
+        layer_results=layer_results,
+        analysis=analysis,
+        output_dir=OUTPUT_DIR,
+        geometry_excel_paths=geometry_excels,
+    )
     save_picks_json(profile_name, all_picks)
     save_layer_json(profile_name, layer_results)
     clear_session_picks_json(profile_name)
@@ -4273,11 +4832,337 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     print(f"\n  Output -> {(OUTPUT_DIR / profile_name).relative_to(CWD.parent)}")
 
 
+def export_arrivals_observed_computed_plot(profile_name: str,
+                                           corrected_by_shot: dict,
+                                           layer_results: dict,
+                                           filename_suffix: str = "") -> Path:
+    """
+    Plot observed and computed first arrivals together vs geometry x.
+
+    This complements the observed-vs-computed scatter by keeping x (offset)
+    explicit and overlaying both curves for each shot/selected side.
+    """
+    c = _tc()
+    fig, axs = plt.subplots(2, 2, figsize=(13.5, 9.0), constrained_layout=False)
+    fig.patch.set_facecolor(c["fig_bg"])
+    ax_geom = axs[0, 0]
+    ax_chan = axs[0, 1]
+    ax_scatter = axs[1, 0]
+    ax_res = axs[1, 1]
+    for ax in (ax_geom, ax_chan, ax_scatter, ax_res):
+        ax.set_facecolor(c["ax_bg"])
+
+    pal = ["#e63946", "#2a9d8f", "#e9c46a", "#457b9d", "#f4a261", "#8d99ae"]
+    all_obs: list = []
+    all_pred: list = []
+    all_x_true: list = []
+    all_chan: list = []
+
+    for i, shot_id in enumerate(sorted(corrected_by_shot)):
+        rows = list(corrected_by_shot.get(shot_id, []))
+        side_map = (layer_results or {}).get(shot_id, {}) or {}
+        fit_side, fit_res = _choose_shot_fit(side_map)
+        if not rows or not fit_res:
+            continue
+
+        if fit_side in ("L", "R"):
+            rows_plot = [r for r in rows if r.get("side") == fit_side]
+            if not rows_plot:
+                rows_plot = rows
+        else:
+            rows_plot = rows
+
+        x_obs: list = []
+        ch_obs: list = []
+        x_true_obs: list = []
+        t_obs: list = []
+        t_cmp: list = []
+        for rr in rows_plot:
+            x = float(rr.get("recv_pos_m", 0.0))
+            x_abs = float(rr.get("true_off_m", abs(x)))
+            ch = float(rr.get("trace_no", 0.0))
+            tobs = float(rr.get("fb_interp_inline_ms", 0.0))
+            tpred = _predict_time_from_fit(x_abs, fit_res)
+            if tpred is None:
+                continue
+            x_obs.append(x)
+            x_true_obs.append(x_abs)
+            ch_obs.append(ch)
+            t_obs.append(tobs)
+            t_cmp.append(float(tpred))
+            all_obs.append(tobs)
+            all_pred.append(float(tpred))
+            all_x_true.append(x_abs)
+            all_chan.append(ch)
+
+        if not x_obs:
+            continue
+
+        order = np.argsort(np.asarray(x_obs, dtype=float))
+        xs = np.asarray(x_obs, dtype=float)[order]
+        to = np.asarray(t_obs, dtype=float)[order]
+        tc = np.asarray(t_cmp, dtype=float)[order]
+        col = pal[i % len(pal)]
+        xc = np.asarray(ch_obs, dtype=float)[order]
+        xt = np.asarray(x_true_obs, dtype=float)[order]
+        ax_geom.plot(xs, to, "o", ms=3.8, color=col, alpha=0.95,
+                 label=f"S{shot_id} obs ({fit_side})")
+        ax_geom.plot(xs, tc, "--", lw=1.3, color=col, alpha=0.9,
+                 label=f"S{shot_id} comp")
+        ax_chan.plot(xc, to, "o", ms=3.6, color=col, alpha=0.95)
+        ax_chan.plot(xc, tc, "--", lw=1.2, color=col, alpha=0.9)
+
+        # Residuals over true offset for this shot
+        ax_res.plot(xt, (to - tc), ".", ms=5, color=col, alpha=0.85)
+
+    if all_obs:
+        oa = np.asarray(all_obs, dtype=float)
+        pa = np.asarray(all_pred, dtype=float)
+        rms = float(np.sqrt(np.mean((oa - pa) ** 2)))
+        ax_geom.text(0.02, 0.98, f"Global RMS = {rms:.3f} ms\nN = {len(oa)}",
+            transform=ax_geom.transAxes, va="top", ha="left",
+                fontsize=9, color=c["text"])
+
+        # Observed vs computed scatter panel
+        ax_scatter.scatter(oa, pa, s=22, color="#2a9d8f", alpha=0.8)
+        lo = float(min(oa.min(), pa.min()))
+        hi = float(max(oa.max(), pa.max()))
+        pad = max(1.0, 0.03 * (hi - lo))
+        lo -= pad
+        hi += pad
+        ax_scatter.plot([lo, hi], [lo, hi], "--", color="#555555", lw=1.1)
+        ax_scatter.set_xlim(lo, hi)
+        ax_scatter.set_ylim(lo, hi)
+    else:
+        ax_geom.text(0.5, 0.5, "No observed/computed pairs", transform=ax_geom.transAxes,
+                ha="center", va="center", color=c["text"])
+
+    ax_geom.set_ylim(T_MAX_MS, 0.0)
+    ax_chan.set_ylim(T_MAX_MS, 0.0)
+    ax_geom.set_xlabel("Geometry x (m)", color=c["label"])
+    ax_geom.set_ylabel("First-break time (ms)", color=c["label"])
+    ax_geom.set_title("Observed + computed vs geometry", color=c["text"], fontsize=10)
+    ax_chan.set_xlabel("Channel", color=c["label"])
+    ax_chan.set_ylabel("First-break time (ms)", color=c["label"])
+    ax_chan.set_title("Observed + computed vs channel", color=c["text"], fontsize=10)
+
+    ax_scatter.set_xlabel("Observed (ms)", color=c["label"])
+    ax_scatter.set_ylabel("Computed (ms)", color=c["label"])
+    ax_scatter.set_title("Observed vs computed", color=c["text"], fontsize=10)
+
+    ax_res.axhline(0.0, color="#666666", lw=1.0, ls="--", alpha=0.8)
+    ax_res.set_xlabel("True offset XO (m)", color=c["label"])
+    ax_res.set_ylabel("Residual (obs-comp) ms", color=c["label"])
+    ax_res.set_title("Residuals over offset", color=c["text"], fontsize=10)
+
+    for ax in (ax_geom, ax_chan, ax_scatter, ax_res):
+        ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+        ax.tick_params(colors=c["tick"])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    handles, labels = ax_geom.get_legend_handles_labels()
+    if handles:
+        ax_geom.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
+                       labelcolor=c["text"], loc="best", ncol=2)
+
+    # Optional top axis with channel ticks for easier interpretation.
+    sample_rows: list = []
+    for sid in sorted(corrected_by_shot):
+        rr = corrected_by_shot.get(sid, [])
+        if rr:
+            sample_rows = rr
+            break
+    if sample_rows:
+        pairs = sorted([(float(r.get("recv_pos_m", 0.0)), int(r.get("trace_no", 0)))
+                        for r in sample_rows], key=lambda p: p[0])
+        xs = np.array([p[0] for p in pairs], dtype=float)
+        ch = [p[1] for p in pairs]
+        if xs.size:
+            ax_top = ax_geom.twiny()
+            ax_top.set_xlim(ax_geom.get_xlim())
+            step = max(1, len(xs) // 10)
+            idxs = list(range(0, len(xs), step))
+            if (len(xs) - 1) not in idxs:
+                idxs.append(len(xs) - 1)
+            ax_top.set_xticks(xs[idxs])
+            ax_top.set_xticklabels([str(ch[i]) for i in idxs], fontsize=7)
+            ax_top.set_xlabel("Channel", color=c["label"], fontsize=8)
+            ax_top.tick_params(colors=c["tick"], labelsize=7)
+            for sp in ax_top.spines.values():
+                sp.set_edgecolor(c["spine"])
+
+    fig.suptitle(f"Profile {profile_name} - Observed/computed diagnostics", color=c["text"], fontsize=11)
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.08, top=0.93, wspace=0.18, hspace=0.22)
+    out_dir = OUTPUT_DIR / profile_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{profile_name}_arrivals_obs_comp{filename_suffix}.png"
+    fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  arrivals   -> {out.relative_to(CWD.parent)}")
+    return out
+
+
+def export_layer_fit_rms_plot(profile_name: str,
+                              corrected_by_shot: dict,
+                              layer_results: dict,
+                              filename_suffix: str = "") -> Path:
+    """
+    Plot layer-average computed arrivals and residual diagnostics over true offset.
+
+    Observed picks are plotted as markers; layer lines and the minimum-time
+    envelope are plotted as solid curves. RMS is reported globally and by
+    controlling layer (which layer produced the minimum-time prediction).
+    """
+    c = _tc()
+    fig, (ax_tx, ax_res) = plt.subplots(1, 2, figsize=(13.0, 5.8), constrained_layout=False)
+    fig.patch.set_facecolor(c["fig_bg"])
+    ax_tx.set_facecolor(c["ax_bg"])
+    ax_res.set_facecolor(c["ax_bg"])
+
+    shot_pos_by_id: dict = {}
+    for sid, rows in (corrected_by_shot or {}).items():
+        if rows:
+            shot_pos_by_id[int(sid)] = float(rows[0].get("shot_pos_m", sid))
+    avg = compute_layer_averages(layer_results or {}, shot_pos_by_id)
+
+    v0 = float((avg.get("V0", {}) or {}).get("avg", 0.0) or 0.0)
+    v1 = float((avg.get("V1", {}) or {}).get("avg", 0.0) or 0.0)
+    v2 = float((avg.get("V2", {}) or {}).get("avg", 0.0) or 0.0)
+    ti1 = float((avg.get("ti1_ms", {}) or {}).get("avg", 0.0) or 0.0)
+    ti2 = float((avg.get("ti2_ms", {}) or {}).get("avg", 0.0) or 0.0)
+
+    # Collect observed points across all shots.
+    x_obs: list = []
+    t_obs: list = []
+    for rows in (corrected_by_shot or {}).values():
+        for r in rows:
+            x_obs.append(float(r.get("true_off_m", 0.0)))
+            t_obs.append(float(r.get("fb_interp_inline_ms", 0.0)))
+
+    if not x_obs:
+        ax_tx.text(0.5, 0.5, "No corrected picks", transform=ax_tx.transAxes,
+                   ha="center", va="center", color=c["text"])
+    else:
+        xa = np.asarray(x_obs, dtype=float)
+        ta = np.asarray(t_obs, dtype=float)
+        order = np.argsort(xa)
+        xa = xa[order]
+        ta = ta[order]
+
+        x_grid = np.linspace(float(np.min(xa)), float(np.max(xa)), 300)
+
+        lines: list = []  # (name, t(x), color)
+        if v0 > 0.0:
+            m0 = 1000.0 / v0
+            lines.append(("L1", m0 * x_grid, "#e63946"))
+        if v1 > 0.0:
+            m1 = 1000.0 / v1
+            lines.append(("L2", m1 * x_grid + ti1, "#2a9d8f"))
+        if v2 > 0.0:
+            m2 = 1000.0 / v2
+            lines.append(("L3", m2 * x_grid + ti2, "#457b9d"))
+
+        if lines:
+            mats = np.vstack([tt for _nm, tt, _cc in lines])
+            env = np.min(mats, axis=0)
+
+            # Prediction and residual assignment for observed points.
+            pred: list = []
+            lay_idx: list = []
+            for xv in xa:
+                cand: list = []
+                if v0 > 0.0:
+                    cand.append((0, (1000.0 / v0) * xv))
+                if v1 > 0.0:
+                    cand.append((1, (1000.0 / v1) * xv + ti1))
+                if v2 > 0.0:
+                    cand.append((2, (1000.0 / v2) * xv + ti2))
+                if not cand:
+                    pred.append(float("nan"))
+                    lay_idx.append(-1)
+                    continue
+                idx, tp = min(cand, key=lambda p: p[1])
+                pred.append(float(tp))
+                lay_idx.append(int(idx))
+
+            pa = np.asarray(pred, dtype=float)
+            mask = np.isfinite(pa)
+            if np.any(mask):
+                rms_all = float(np.sqrt(np.mean((ta[mask] - pa[mask]) ** 2)))
+            else:
+                rms_all = 0.0
+
+            ax_tx.plot(xa, ta, "o", ms=3.3, color="#111111", alpha=0.75, label="Observed")
+            for nm, tt, cc in lines:
+                ax_tx.plot(x_grid, tt, "-", lw=1.5, color=cc, alpha=0.9, label=f"{nm} computed")
+            ax_tx.plot(x_grid, env, "-", lw=2.0, color="#000000", alpha=0.85,
+                       label=f"Envelope (RMS={rms_all:.3f} ms)")
+
+            # Residuals and per-layer RMS.
+            if np.any(mask):
+                res = ta[mask] - pa[mask]
+                x_m = xa[mask]
+                idx_m = np.asarray(lay_idx, dtype=int)[mask]
+                cols = ["#e63946", "#2a9d8f", "#457b9d"]
+                for li in (0, 1, 2):
+                    mli = (idx_m == li)
+                    if not np.any(mli):
+                        continue
+                    rms_li = float(np.sqrt(np.mean((res[mli]) ** 2)))
+                    ax_res.plot(x_m[mli], res[mli], ".", ms=5, color=cols[li], alpha=0.85,
+                                label=f"Layer {li+1} RMS={rms_li:.3f} ms")
+                ax_res.axhline(0.0, color="#666666", lw=1.0, ls="--")
+                ax_res.text(0.02, 0.98, f"Global RMS = {rms_all:.3f} ms\nN={int(np.sum(mask))}",
+                            transform=ax_res.transAxes, va="top", ha="left",
+                            fontsize=9, color=c["text"])
+        else:
+            ax_tx.plot(xa, ta, "o", ms=3.3, color="#111111", alpha=0.75, label="Observed")
+            ax_tx.text(0.5, 0.1, "No valid average layer velocities", transform=ax_tx.transAxes,
+                       ha="center", va="center", color=c["label"], fontsize=8)
+
+    ax_tx.set_ylim(T_MAX_MS, 0.0)
+    ax_tx.set_xlabel("True offset XO (m)", color=c["label"])
+    ax_tx.set_ylabel("Arrival time (ms)", color=c["label"])
+    ax_tx.set_title("Average-layer fit over offset", color=c["text"], fontsize=10)
+
+    ax_res.set_xlabel("True offset XO (m)", color=c["label"])
+    ax_res.set_ylabel("Residual (obs-comp) ms", color=c["label"])
+    ax_res.set_title("Residuals by controlling layer", color=c["text"], fontsize=10)
+
+    for ax in (ax_tx, ax_res):
+        ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+        ax.tick_params(colors=c["tick"])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(c["spine"])
+
+    h1, _ = ax_tx.get_legend_handles_labels()
+    if h1:
+        ax_tx.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
+                     labelcolor=c["text"], loc="best")
+    h2, _ = ax_res.get_legend_handles_labels()
+    if h2:
+        ax_res.legend(fontsize=8, facecolor=c["leg_face"], edgecolor=c["leg_edge"],
+                      labelcolor=c["text"], loc="best")
+
+    fig.suptitle(f"Profile {profile_name} - Layer-fit RMS diagnostics", color=c["text"], fontsize=11)
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.20)
+
+    out_dir = OUTPUT_DIR / profile_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{profile_name}_layer_fit_rms{filename_suffix}.png"
+    fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  layer_fit -> {out.relative_to(CWD.parent)}")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: parse arguments, resolve targets, and process profiles."""
     parser = argparse.ArgumentParser(
         prog="lvl_refraction.py",
         description="LVL refraction seismic: interactive picking + analysis.",
@@ -4346,36 +5231,47 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    perp_excel_cfg = None
+    sheet_val: str | int | None = args.perp_sheet
+    if sheet_val is not None:
+        s_try = str(sheet_val).strip()
+        if s_try.isdigit():
+            sheet_val = int(s_try)
+
+    report_paths: list = []
     if args.perp_excel:
-        sheet_val: str | int | None = args.perp_sheet
-        if sheet_val is not None:
-            s_try = str(sheet_val).strip()
-            if s_try.isdigit():
-                sheet_val = int(s_try)
-        perp_excel_cfg = {
-            "path": args.perp_excel,
-            "sheet": sheet_val,
-            "ffid_col": args.perp_col_ffid,
-            "perp_col": args.perp_col_perp,
-            "profile_col": args.perp_col_profile,
-            "inline_shift_col": args.perp_col_inline_shift,
-        }
+        report_paths = [str(Path(args.perp_excel))]
     else:
-        auto_excel = discover_field_report_excel(DATA_DIR)
-        if auto_excel is not None:
-            perp_excel_cfg = {
-                "path": str(auto_excel),
-                "sheet": None,
-                "ffid_col": args.perp_col_ffid,
-                "perp_col": args.perp_col_perp,
-                "profile_col": args.perp_col_profile,
-                "inline_shift_col": args.perp_col_inline_shift,
-            }
-            print(f"  Auto field report detected: {auto_excel.relative_to(CWD.parent)}")
+        report_paths = [str(p) for p in discover_field_report_excels(DATA_DIR)]
+        if report_paths:
+            print("  Auto field reports detected:")
+            for p in report_paths:
+                try:
+                    print(f"    - {Path(p).relative_to(CWD.parent)}")
+                except Exception:
+                    print(f"    - {p}")
+
+    geometry_paths: list = []
+    for p in DATA_DIR.glob("LVL*.xls*"):
+        name = p.name.lower()
+        if "field_report" in name or "fieldreport" in name:
+            continue
+        geometry_paths.append(str(p))
+
+    perp_excel_cfg = {
+        "paths": report_paths,
+        "sheet": sheet_val,
+        "ffid_col": args.perp_col_ffid,
+        "perp_col": args.perp_col_perp,
+        "profile_col": args.perp_col_profile,
+        "inline_shift_col": args.perp_col_inline_shift,
+        "geometry_paths": geometry_paths,
+    }
 
     if args.all:
-        targets = list(PROFILES)
+        targets = discover_profile_folders(DATA_DIR)
+        if not targets:
+            print("[ERROR] No profile folders with SEG2 files found under data/.")
+            return
     elif args.profile:
         targets = [args.profile]
     else:
@@ -4401,15 +5297,17 @@ def main():
             targets = [chosen_profile]
         else:
             print("\nAvailable profiles:")
-            print(f"  {'Name':<12}  {'Geom':>6}  {'Perp_m':>7}  Data folder")
-            print(f"  {'-'*12}  {'-'*6}  {'-'*7}  {'-'*30}")
-            for pname, pcfg in PROFILES.items():
+            print(f"  {'Name':<16}  {'Geom':>6}  {'Data folder':<30}")
+            print(f"  {'-'*16}  {'-'*6}  {'-'*30}")
+            dynamic_profiles = discover_profile_folders(DATA_DIR)
+            if not dynamic_profiles:
+                print("  (none found)")
+            for pname in dynamic_profiles:
+                pcfg = PROFILES.get(pname, {"geom": 200})
                 folder = DATA_DIR / pname
-                status = "found" if folder.exists() else "MISSING"
-                n_seg2 = len(list(folder.glob("*.seg2"))) if folder.exists() else 0
-                print(f"  {pname:<12}  {pcfg['geom']:>5}m  "
-                      f"{pcfg.get('perp_m', 0.0):>7.1f}m  "
-                      f"{status}  ({n_seg2} SEG2 files)")
+                n_seg2 = len(list(folder.glob("*.seg2"))) + len(list(folder.glob("*.SEG2")))
+                print(f"  {pname:<16}  {int(pcfg.get('geom', 200)):>5}m  "
+                      f"found ({n_seg2} SEG2 files)")
             print(f"\nUsage:  python lvl_refraction.py <profile>  [--export-only]")
             return
 
