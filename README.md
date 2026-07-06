@@ -315,3 +315,5 @@ Notes on mapping formula-to-implementation:
 1. Velocity from slope and line fitting: see fit sections and exported per-shot slope/intercept in the script outputs.
 2. Two-layer and three-layer intercept-time depth equations: implemented in depth_2layer and depth_3layer in lvl/scripts/lvl_refraction.py.
 3. RMS equation: implemented in fit review and analysis export paths in lvl/scripts/lvl_refraction.py.
+
+## 14) Results export
