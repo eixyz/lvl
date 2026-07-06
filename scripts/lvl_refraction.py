@@ -1098,7 +1098,7 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
 
     _apply_preview()
 
-    status_ax = fig.add_axes([0.04, 0.08, 0.58, 0.05])
+    status_ax = fig.add_axes([0.04, 0.14, 0.33, 0.045])
     status_ax.set_facecolor(c["ax_bg"])
     status_ax.set_xticks([])
     status_ax.set_yticks([])
@@ -1108,9 +1108,10 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
                                 fontsize=8, va="center", ha="left",
                                 transform=status_ax.transAxes)
 
-    ax_ok = fig.add_axes([0.64, 0.08, 0.15, 0.05])
-    ax_ref = fig.add_axes([0.81, 0.08, 0.15, 0.05])
-    ax_def = fig.add_axes([0.81, 0.14, 0.15, 0.05])
+    # Keep controls below input fields so preview plot stays visually clean.
+    ax_ok = fig.add_axes([0.04, 0.08, 0.105, 0.045])
+    ax_ref = fig.add_axes([0.155, 0.08, 0.105, 0.045])
+    ax_def = fig.add_axes([0.27, 0.08, 0.105, 0.045])
     btn_ok = Button(ax_ok, "Use Values", color=c["ax_bg"],
                     hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d")
     btn_ref = Button(ax_ref, "Refresh", color=c["ax_bg"],
@@ -4782,11 +4783,6 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     save_layer_session_json(profile_name, layer_results)
 
     qc_suffix = "_preview" if preview_only else ""
-    export_corrected_qc_plot(profile_name, corrected_by_shot,
-                             shot_label_pos=shot_label_pos,
-                             layer_results=layer_results,
-                             filename_suffix=qc_suffix,
-                             show_plot=True)
 
     if preview_only:
         export_excel(profile_name, shots_info_proc, all_picks, recv_positions,
@@ -4798,8 +4794,12 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
                        analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
                        corrected_by_shot=corrected_by_shot, layer_results=layer_results)
-        export_fit_plot(profile_name, corrected_by_shot, layer_results,
-                        filename_suffix="_preview")
+        export_arrivals_observed_computed_plot(
+            profile_name, corrected_by_shot, layer_results, filename_suffix="_preview"
+        )
+        export_layer_fit_rms_plot(
+            profile_name, corrected_by_shot, layer_results, filename_suffix="_preview"
+        )
         print("  Preview files written; final picks.json not updated.")
         return
 
@@ -4812,8 +4812,8 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
                    analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
                    corrected_by_shot=corrected_by_shot, layer_results=layer_results)
-    export_fit_plot(profile_name, corrected_by_shot, layer_results)
     export_arrivals_observed_computed_plot(profile_name, corrected_by_shot, layer_results)
+    export_layer_fit_rms_plot(profile_name, corrected_by_shot, layer_results)
     geometry_excels = [Path(p) for p in (perp_excel_cfg or {}).get("geometry_paths", []) if p]
     export_velocity_summary_excel(
         profile_name=profile_name,
@@ -4861,59 +4861,67 @@ def export_arrivals_observed_computed_plot(profile_name: str,
     for i, shot_id in enumerate(sorted(corrected_by_shot)):
         rows = list(corrected_by_shot.get(shot_id, []))
         side_map = (layer_results or {}).get(shot_id, {}) or {}
-        fit_side, fit_res = _choose_shot_fit(side_map)
-        if not rows or not fit_res:
+        if not rows or not side_map:
             continue
 
-        if fit_side in ("L", "R"):
-            rows_plot = [r for r in rows if r.get("side") == fit_side]
-            if not rows_plot:
-                rows_plot = rows
-        else:
-            rows_plot = rows
+        ordered_sides = [s for s in ("L", "R", "ALL") if s in side_map]
+        ordered_sides += [s for s in side_map if s not in ordered_sides]
 
-        x_obs: list = []
-        ch_obs: list = []
-        x_true_obs: list = []
-        t_obs: list = []
-        t_cmp: list = []
-        for rr in rows_plot:
-            x = float(rr.get("recv_pos_m", 0.0))
-            x_abs = float(rr.get("true_off_m", abs(x)))
-            ch = float(rr.get("trace_no", 0.0))
-            tobs = float(rr.get("fb_interp_inline_ms", 0.0))
-            tpred = _predict_time_from_fit(x_abs, fit_res)
-            if tpred is None:
+        for side in ordered_sides:
+            fit_res = side_map.get(side)
+            if not fit_res:
                 continue
-            x_obs.append(x)
-            x_true_obs.append(x_abs)
-            ch_obs.append(ch)
-            t_obs.append(tobs)
-            t_cmp.append(float(tpred))
-            all_obs.append(tobs)
-            all_pred.append(float(tpred))
-            all_x_true.append(x_abs)
-            all_chan.append(ch)
 
-        if not x_obs:
-            continue
+            if side in ("L", "R"):
+                rows_plot = [r for r in rows if r.get("side") == side]
+                if not rows_plot:
+                    continue
+            else:
+                rows_plot = rows
 
-        order = np.argsort(np.asarray(x_obs, dtype=float))
-        xs = np.asarray(x_obs, dtype=float)[order]
-        to = np.asarray(t_obs, dtype=float)[order]
-        tc = np.asarray(t_cmp, dtype=float)[order]
-        col = pal[i % len(pal)]
-        xc = np.asarray(ch_obs, dtype=float)[order]
-        xt = np.asarray(x_true_obs, dtype=float)[order]
-        ax_geom.plot(xs, to, "o", ms=3.8, color=col, alpha=0.95,
-                 label=f"S{shot_id} obs ({fit_side})")
-        ax_geom.plot(xs, tc, "--", lw=1.3, color=col, alpha=0.9,
-                 label=f"S{shot_id} comp")
-        ax_chan.plot(xc, to, "o", ms=3.6, color=col, alpha=0.95)
-        ax_chan.plot(xc, tc, "--", lw=1.2, color=col, alpha=0.9)
+            x_obs: list = []
+            ch_obs: list = []
+            x_true_obs: list = []
+            t_obs: list = []
+            t_cmp: list = []
+            for rr in rows_plot:
+                x = float(rr.get("recv_pos_m", 0.0))
+                x_abs = float(rr.get("true_off_m", abs(x)))
+                ch = float(rr.get("trace_no", 0.0))
+                tobs = float(rr.get("fb_interp_inline_ms", 0.0))
+                tpred = _predict_time_from_fit(x_abs, fit_res)
+                if tpred is None:
+                    continue
+                x_obs.append(x)
+                x_true_obs.append(x_abs)
+                ch_obs.append(ch)
+                t_obs.append(tobs)
+                t_cmp.append(float(tpred))
+                all_obs.append(tobs)
+                all_pred.append(float(tpred))
+                all_x_true.append(x_abs)
+                all_chan.append(ch)
 
-        # Residuals over true offset for this shot
-        ax_res.plot(xt, (to - tc), ".", ms=5, color=col, alpha=0.85)
+            if not x_obs:
+                continue
+
+            order = np.argsort(np.asarray(x_obs, dtype=float))
+            xs = np.asarray(x_obs, dtype=float)[order]
+            to = np.asarray(t_obs, dtype=float)[order]
+            tc = np.asarray(t_cmp, dtype=float)[order]
+            col = pal[i % len(pal)]
+            xc = np.asarray(ch_obs, dtype=float)[order]
+            xt = np.asarray(x_true_obs, dtype=float)[order]
+            ls = "--" if side != "R" else ":"
+            ax_geom.plot(xs, to, "o", ms=3.8, color=col, alpha=0.95,
+                     label=f"S{shot_id}-{side} obs")
+            ax_geom.plot(xs, tc, ls, lw=1.3, color=col, alpha=0.9,
+                     label=f"S{shot_id}-{side} comp")
+            ax_chan.plot(xc, to, "o", ms=3.6, color=col, alpha=0.95)
+            ax_chan.plot(xc, tc, ls, lw=1.2, color=col, alpha=0.9)
+
+            # Residuals over true offset for this shot-side
+            ax_res.plot(xt, (to - tc), ".", ms=5, color=col, alpha=0.85)
 
     if all_obs:
         oa = np.asarray(all_obs, dtype=float)
@@ -5035,10 +5043,23 @@ def export_layer_fit_rms_plot(profile_name: str,
     # Collect observed points across all shots.
     x_obs: list = []
     t_obs: list = []
-    for rows in (corrected_by_shot or {}).values():
+    side_obs: list = []
+    shot_obs: list = []
+    shot_pos_sorted = sorted(
+        ((int(sid), float(rows[0].get("shot_pos_m", sid)))
+         for sid, rows in (corrected_by_shot or {}).items() if rows),
+        key=lambda p: p[1],
+    )
+    shot_order = [sid for sid, _ in shot_pos_sorted]
+    shot_rank = {sid: i for i, sid in enumerate(shot_order)}
+    n_shots = len(shot_order)
+
+    for sid, rows in (corrected_by_shot or {}).items():
         for r in rows:
             x_obs.append(float(r.get("true_off_m", 0.0)))
             t_obs.append(float(r.get("fb_interp_inline_ms", 0.0)))
+            side_obs.append(str(r.get("side", "R")))
+            shot_obs.append(int(sid))
 
     if not x_obs:
         ax_tx.text(0.5, 0.5, "No corrected picks", transform=ax_tx.transAxes,
@@ -5046,11 +5067,15 @@ def export_layer_fit_rms_plot(profile_name: str,
     else:
         xa = np.asarray(x_obs, dtype=float)
         ta = np.asarray(t_obs, dtype=float)
+        sid_a = np.asarray(shot_obs, dtype=int)
+        side_a = np.asarray(side_obs, dtype=object)
         order = np.argsort(xa)
         xa = xa[order]
         ta = ta[order]
+        sid_a = sid_a[order]
+        side_a = side_a[order]
 
-        x_grid = np.linspace(float(np.min(xa)), float(np.max(xa)), 300)
+        x_grid = np.linspace(0.0, float(np.max(xa)), 320)
 
         lines: list = []  # (name, t(x), color)
         if v0 > 0.0:
@@ -5093,9 +5118,61 @@ def export_layer_fit_rms_plot(profile_name: str,
             else:
                 rms_all = 0.0
 
-            ax_tx.plot(xa, ta, "o", ms=3.3, color="#111111", alpha=0.75, label="Observed")
+            def _obs_group_label(sid: int, side: str) -> str:
+                if n_shots <= 0:
+                    return "Observed"
+                rnk = shot_rank.get(int(sid), 0)
+                side_s = "-" if str(side).upper() == "L" else "+"
+                if n_shots == 1:
+                    return f"Centre{side_s}"
+                if n_shots == 2:
+                    return "Off-end+" if side_s == "+" else "Off-end-"
+                if n_shots == 3:
+                    if rnk == 1:
+                        return f"Centre{side_s}"
+                    return "Off-end+" if side_s == "+" else "Off-end-"
+
+                # Optional far groups for >3 shots.
+                c_mid = (n_shots - 1) / 2.0
+                d = rnk - c_mid
+                mag = abs(d)
+                if mag <= 0.5:
+                    return f"Centre{side_s}"
+                if mag <= 1.5:
+                    return "Off-end+" if side_s == "+" else "Off-end-"
+                if mag <= 2.5:
+                    return "Far+" if d > 0 else "Far-"
+                return "Far++" if d > 0 else "Far--"
+
+            grp_colors = {
+                "Off-end-": "#6d597a",
+                "Centre-": "#457b9d",
+                "Centre+": "#2a9d8f",
+                "Off-end+": "#f4a261",
+                "Far-": "#8d99ae",
+                "Far+": "#e9c46a",
+                "Far--": "#5c677d",
+                "Far++": "#b08968",
+                "Observed": "#111111",
+            }
+
+            grp_xy: dict = {}
+            for xv, tv, sid, sside in zip(xa, ta, sid_a, side_a):
+                g = _obs_group_label(int(sid), str(sside))
+                grp_xy.setdefault(g, [[], []])
+                grp_xy[g][0].append(float(xv))
+                grp_xy[g][1].append(float(tv))
+
+            grp_order = ["Off-end-", "Centre-", "Centre+", "Off-end+", "Far-", "Far+", "Far--", "Far++", "Observed"]
+            for g in grp_order:
+                if g not in grp_xy:
+                    continue
+                gx, gt = grp_xy[g]
+                ax_tx.plot(gx, gt, "o", ms=3.5, alpha=0.85,
+                           color=grp_colors.get(g, "#111111"), label=g)
+
             for nm, tt, cc in lines:
-                ax_tx.plot(x_grid, tt, "-", lw=1.5, color=cc, alpha=0.9, label=f"{nm} computed")
+                ax_tx.plot(x_grid, tt, "--", lw=1.4, color=cc, alpha=0.9, label=f"{nm} computed")
             ax_tx.plot(x_grid, env, "-", lw=2.0, color="#000000", alpha=0.85,
                        label=f"Envelope (RMS={rms_all:.3f} ms)")
 
@@ -5116,6 +5193,21 @@ def export_layer_fit_rms_plot(profile_name: str,
                 ax_res.text(0.02, 0.98, f"Global RMS = {rms_all:.3f} ms\nN={int(np.sum(mask))}",
                             transform=ax_res.transAxes, va="top", ha="left",
                             fontsize=9, color=c["text"])
+
+            # Small summary table for average model parameters.
+            h0 = float(avg.get("h1_m", 0.0) or 0.0)
+            h1v = float(avg.get("h2_m", 0.0) or 0.0)
+            tbl = [[f"{v0:.1f}", f"{v1:.1f}", f"{h0:.2f}", f"{v2:.1f}", f"{h1v:.2f}"]]
+            table = ax_tx.table(
+                cellText=tbl,
+                colLabels=["v0", "v1", "h0", "v2", "h1"],
+                loc="upper right",
+                cellLoc="center",
+                colLoc="center",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1.0, 1.12)
         else:
             ax_tx.plot(xa, ta, "o", ms=3.3, color="#111111", alpha=0.75, label="Observed")
             ax_tx.text(0.5, 0.1, "No valid average layer velocities", transform=ax_tx.transAxes,
