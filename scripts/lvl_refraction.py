@@ -2026,9 +2026,12 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
     ax_tx.plot(x, t, "o", ms=4, color="#1f77b4", alpha=0.9, label="Observed")
     wins = list((fit_res or {}).get("windows", []) or [])
     segs = list((fit_res or {}).get("segments", []) or [])
+    vel_lines: list = []
     for i, seg in enumerate(segs):
         sl = float(seg.get("slope_ms_m", 0.0))
         ic = float(seg.get("intercept_ms", 0.0))
+        vel_val = float(seg.get("velocity_m_s", 0.0) or 0.0)
+        vel_lines.append(f"L{i+1}: {vel_val:.0f} m/s")
         if sl <= 0.0:
             continue
         w = wins[i] if i < len(wins) else None
@@ -2041,10 +2044,18 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
         xl = np.linspace(x0, x1, 40)
         tl = sl * xl + ic
         ax_tx.plot(xl, tl, "-", lw=1.6, alpha=0.9, color="#e63946")
-        xm = 0.5 * (x0 + x1)
-        tm = float(sl * xm + ic)
-        ax_tx.text(xm, tm - 2.0, f"V={seg.get('velocity_m_s', 0.0):.0f} m/s",
-                   fontsize=7, color="#e63946", ha="center")
+
+    if vel_lines:
+        ax_tx.text(
+            0.02, 0.02,
+            "Apparent velocity\n" + "\n".join(vel_lines),
+            transform=ax_tx.transAxes,
+            va="bottom", ha="left",
+            fontsize=8,
+            color=c["text"],
+            bbox=dict(boxstyle="round,pad=0.35",
+                      facecolor=c["ax_bg"], edgecolor=c["spine"], alpha=0.90),
+        )
 
     pred_all: list = []
     obs_all: list = []
@@ -5190,24 +5201,40 @@ def export_layer_fit_rms_plot(profile_name: str,
                     ax_res.plot(x_m[mli], res[mli], ".", ms=5, color=cols[li], alpha=0.85,
                                 label=f"Layer {li+1} RMS={rms_li:.3f} ms")
                 ax_res.axhline(0.0, color="#666666", lw=1.0, ls="--")
-                ax_res.text(0.02, 0.98, f"Global RMS = {rms_all:.3f} ms\nN={int(np.sum(mask))}",
-                            transform=ax_res.transAxes, va="top", ha="left",
-                            fontsize=9, color=c["text"])
+                ax_res.text(
+                    0.02, 0.02,
+                    f"Global RMS: {rms_all:.3f} ms\nN: {int(np.sum(mask))}",
+                    transform=ax_res.transAxes,
+                    va="bottom", ha="left",
+                    fontsize=9,
+                    color=c["text"],
+                    bbox=dict(boxstyle="round,pad=0.35",
+                              facecolor=c["ax_bg"], edgecolor=c["spine"], alpha=0.90),
+                )
 
-            # Small summary table for average model parameters.
+            # Compact key:value summary in a padded lower-left box.
             h0 = float(avg.get("h1_m", 0.0) or 0.0)
             h1v = float(avg.get("h2_m", 0.0) or 0.0)
-            tbl = [[f"{v0:.1f}", f"{v1:.1f}", f"{h0:.2f}", f"{v2:.1f}", f"{h1v:.2f}"]]
-            table = ax_tx.table(
-                cellText=tbl,
-                colLabels=["v0", "v1", "h0", "v2", "h1"],
-                loc="upper right",
-                cellLoc="center",
-                colLoc="center",
+            summary_txt = (
+                "Layer model\n"
+                f"V0: {v0:.1f} m/s\n"
+                f"V1: {v1:.1f} m/s\n"
+                f"V2: {v2:.1f} m/s\n"
+                f"ti1: {ti1:.2f} ms\n"
+                f"ti2: {ti2:.2f} ms\n"
+                f"h0: {h0:.2f} m\n"
+                f"h1: {h1v:.2f} m"
             )
-            table.auto_set_font_size(False)
-            table.set_fontsize(8)
-            table.scale(1.0, 1.12)
+            ax_tx.text(
+                0.02, 0.02,
+                summary_txt,
+                transform=ax_tx.transAxes,
+                va="bottom", ha="left",
+                fontsize=8,
+                color=c["text"],
+                bbox=dict(boxstyle="round,pad=0.4",
+                          facecolor=c["ax_bg"], edgecolor=c["spine"], alpha=0.92),
+            )
         else:
             ax_tx.plot(xa, ta, "o", ms=3.3, color="#111111", alpha=0.75, label="Observed")
             ax_tx.text(0.5, 0.1, "No valid average layer velocities", transform=ax_tx.transAxes,

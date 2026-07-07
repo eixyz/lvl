@@ -41,11 +41,16 @@ def _ensure(pkg: str, mod: str = "") -> Any:
 np = _ensure("numpy")
 _ensure("obspy")
 _ensure("matplotlib")
+_ensure("scipy")
+pd = _ensure("pandas")
+_ensure("openpyxl")
+_ensure("xlrd")
 
-from obspy import read as _read_obspy  # type: ignore[import-untyped]
+from obspy import Trace, read as _read_obspy  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button, Slider, TextBox
+from scipy.signal import butter as _scipy_butter, hilbert as _scipy_hilbert, sosfiltfilt as _scipy_sosfiltfilt
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +84,8 @@ BP_F3: float = 140.0
 BP_F4: float = 180.0
 BP_FFT_PAD: float = 0.25
 BP_REAPPLY: bool = False
+BUTTER_ORDER: int = 4
+FILTER_DEBOUNCE_MS: int = 40
 
 # Display setup
 THEME: str = "light"
@@ -97,6 +104,11 @@ AGC_STAT: str = "rms"  # "mean" | "rms"
 STA_MS: float = 3.0
 LTA_MS: float = 20.0
 STALTA_TRIG: float = 3.0
+AUTO_PICK_MODE: str = "stalta"  # "stalta" | "maxdiff_zero" | "hilbert_env"
+ZERO_X_SEARCH_DIRECTION: str = "backward"  # "backward" | "forward"
+HILBERT_ONSET_PCT: float = 0.20
+PICK_PROCESS_ORDER: str = "F>G>X"  # "F>G>X" | "G>F>X" | "RAW>X"
+MANUAL_SNAP_WIN_MS: float = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +227,143 @@ def auto_shot_positions(recv_pos: Any) -> dict:
     }
 
 
+def _normalize_profile_token(value: Any) -> str:
+    """Normalize profile strings for robust matching (LVL150, 150, 214_A, etc.)."""
+    s = str(value or "").strip().upper().replace(" ", "")
+    s = s.replace("_", "").replace("-", "")
+    if s.startswith("LVL"):
+        s = s[3:]
+    return s
+
+
+def discover_profile_folders(data_dir: Path) -> list:
+    """Return profile folders under data/ that contain SEG2 files."""
+    out: list = []
+    for p in sorted(data_dir.iterdir() if data_dir.exists() else []):
+        if not p.is_dir():
+            continue
+        if any(p.glob("*.seg2")) or any(p.glob("*.SEG2")):
+            out.append(p.name)
+    return out
+
+
+def discover_lvl_geometry_excels(data_dir: Path) -> list:
+    """Find likely LVL geometry excel files, newest first."""
+    pats = ["LVL*.xls", "LVL*.xlsx", "*lvl*.xls", "*lvl*.xlsx"]
+    out: list = []
+    seen: set[str] = set()
+    for pat in pats:
+        for p in data_dir.glob(pat):
+            key = str(p.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return out
+
+
+def _to_float_or_none(v: Any) -> float | None:
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    s = str(v).strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _detect_station_table_columns(df: Any) -> tuple | None:
+    """Detect header row and key columns for LVL Number / Station / optional X,Y."""
+    if df is None or df.empty:
+        return None
+
+    def _norm(v: Any) -> str:
+        return " ".join(str(v or "").strip().lower().replace("_", " ").replace("-", " ").split())
+
+    max_scan = min(40, int(df.shape[0]))
+    for ridx in range(max_scan):
+        row = [_norm(v) for v in df.iloc[ridx].tolist()]
+        i_prof = None
+        i_sta = None
+        i_x = None
+        i_y = None
+        for ci, txt in enumerate(row):
+            if not txt:
+                continue
+            if i_prof is None and (("lvl" in txt and "number" in txt) or txt in ("lvl", "profile", "line")):
+                i_prof = ci
+            if i_sta is None and "station" in txt:
+                i_sta = ci
+            if i_x is None and txt in ("x", "east", "easting"):
+                i_x = ci
+            if i_y is None and txt in ("y", "north", "northing"):
+                i_y = ci
+        if None not in (i_prof, i_sta):
+            return ridx, i_prof, i_sta, i_x, i_y
+    return None
+
+
+def infer_geometry_from_lvl_excel(data_dir: Path, profile_name: str) -> tuple[int | None, Path | None, float | None]:
+    """
+    Infer geometry from LVL geometry excel by matching profile + stations.
+
+    Preference:
+    - distance between station 0.5 and 48.5 derived from X/Y if available,
+    - otherwise station numeric difference.
+    """
+    target = _normalize_profile_token(profile_name)
+    files = discover_lvl_geometry_excels(data_dir)
+    for path in files:
+        try:
+            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+        except Exception:
+            continue
+
+        for _sheet_name, df in sheets.items():
+            cols = _detect_station_table_columns(df)
+            if cols is None:
+                continue
+            hdr_row, i_prof, i_sta, i_x, i_y = cols
+
+            rows: list[tuple[float, float | None, float | None]] = []
+            for ridx in range(hdr_row + 1, int(df.shape[0])):
+                p_raw = df.iat[ridx, i_prof] if i_prof < df.shape[1] else None
+                if _normalize_profile_token(p_raw) != target:
+                    continue
+                s_raw = df.iat[ridx, i_sta] if i_sta < df.shape[1] else None
+                sta = _to_float_or_none(s_raw)
+                if sta is None:
+                    continue
+                xv = _to_float_or_none(df.iat[ridx, i_x]) if i_x is not None and i_x < df.shape[1] else None
+                yv = _to_float_or_none(df.iat[ridx, i_y]) if i_y is not None and i_y < df.shape[1] else None
+                rows.append((float(sta), xv, yv))
+
+            if len(rows) < 2:
+                continue
+
+            s0 = min(rows, key=lambda r: abs(r[0] - 0.5))
+            s1 = min(rows, key=lambda r: abs(r[0] - 48.5))
+
+            dist = None
+            if (s0[1] is not None and s0[2] is not None and s1[1] is not None and s1[2] is not None):
+                dist = float(np.hypot(float(s1[1]) - float(s0[1]), float(s1[2]) - float(s0[2])))
+            else:
+                dist = abs(float(s1[0]) - float(s0[0]))
+
+            if abs(dist - 94.0) <= 12.0:
+                return 100, path, dist
+            if abs(dist - 192.5) <= 16.0:
+                return 200, path, dist
+
+    return None, None, None
+
+
 def read_seg2(path: Path) -> tuple:
     """
     Read one SEG2 shot.
@@ -326,6 +475,175 @@ def apply_ormsby_all_params(data: Any, dt_s: float, f1: float, f2: float, f3: fl
     return out
 
 
+def butterworth_bandpass(
+    trace: Any,
+    dt_s: float,
+    low_hz: float,
+    high_hz: float,
+    order: int = BUTTER_ORDER,
+) -> Any:
+    """Zero-phase Butterworth bandpass using scipy SOS filtering."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size < 8:
+        return np.asarray(trace, dtype=np.float32)
+
+    fs = 1.0 / max(float(dt_s), 1e-12)
+    nyq = 0.5 * fs
+    lo = max(0.001, float(low_hz))
+    hi = min(float(high_hz), nyq * 0.999)
+    if not (0.0 < lo < hi < nyq):
+        return np.asarray(trace, dtype=np.float32)
+
+    sos = _scipy_butter(int(max(1, order)), [lo, hi], btype="bandpass", fs=fs, output="sos")
+    try:
+        y = _scipy_sosfiltfilt(sos, x)
+    except Exception:
+        y = x
+    return np.asarray(y, dtype=np.float32)
+
+
+def apply_butterworth_all_params(
+    data: Any,
+    dt_s: float,
+    low_hz: float,
+    high_hz: float,
+    order: int = BUTTER_ORDER,
+) -> Any:
+    """Apply Butterworth bandpass to all traces in a shot gather."""
+    out = np.empty_like(data)
+    for i in range(data.shape[0]):
+        out[i] = butterworth_bandpass(data[i], dt_s, low_hz=low_hz, high_hz=high_hz, order=order)
+    return out
+
+
+def _zero_crossing_from_extremum_samples(
+    samples: Any,
+    dt_s: float,
+    win_start_s: float,
+    win_end_s: float,
+    search_direction: str = "backward",
+    use_abs_peak: bool = True,
+) -> float | None:
+    """Return zero-crossing time (s) near local extremum in a window."""
+    x = np.asarray(samples, dtype=float)
+    if x.size < 2:
+        return None
+
+    i0 = max(0, int(np.floor(win_start_s / dt_s)))
+    i1 = min(x.size - 1, int(np.ceil(win_end_s / dt_s)))
+    if i1 <= i0:
+        return None
+
+    seg = x[i0:i1 + 1]
+    if seg.size == 0:
+        return None
+
+    if use_abs_peak:
+        rel_idx = int(np.argmax(np.abs(seg)))
+    else:
+        rel_idx = int(np.argmax(seg))
+    peak_idx = i0 + rel_idx
+
+    direction = str(search_direction).strip().lower()
+    if direction not in {"backward", "forward"}:
+        direction = "backward"
+
+    if direction == "backward":
+        if x[peak_idx] == 0.0:
+            return peak_idx * dt_s
+        for right in range(peak_idx, i0, -1):
+            left = right - 1
+            y0 = float(x[left])
+            y1 = float(x[right])
+            if y0 == 0.0:
+                return left * dt_s
+            if y1 == 0.0:
+                return right * dt_s
+            if y0 * y1 < 0.0:
+                frac = -y0 / (y1 - y0)
+                return (left + frac) * dt_s
+    else:
+        if x[peak_idx] == 0.0:
+            return peak_idx * dt_s
+        for left in range(peak_idx, i1):
+            right = left + 1
+            y0 = float(x[left])
+            y1 = float(x[right])
+            if y0 == 0.0:
+                return left * dt_s
+            if y1 == 0.0:
+                return right * dt_s
+            if y0 * y1 < 0.0:
+                frac = -y0 / (y1 - y0)
+                return (left + frac) * dt_s
+
+    return peak_idx * dt_s
+
+
+def hilbert_envelope_pick(
+    trace: Trace,
+    win_start_s: float,
+    win_end_s: float,
+    onset_pct: float | None = HILBERT_ONSET_PCT,
+    noise_window_s: tuple[float, float] | None = None,
+) -> tuple[Any, float | None, float | None]:
+    """
+    Compute Hilbert envelope and pick arrival in a time window.
+
+    Returns
+    -------
+    envelope : ndarray
+        Instantaneous amplitude envelope (same sample length as input trace).
+    peak_time_s : float | None
+        Time of envelope maximum in the search window (seconds from trace start).
+    onset_time_s : float | None
+        Optional onset time where envelope first exceeds threshold before peak.
+    """
+    x = np.asarray(trace.data, dtype=float)
+    if x.size < 2:
+        return np.asarray([], dtype=np.float32), None, None
+
+    dt_s = float(trace.stats.delta)
+    env = np.abs(_scipy_hilbert(x))
+
+    i0 = max(0, int(np.floor(float(win_start_s) / dt_s)))
+    i1 = min(x.size - 1, int(np.ceil(float(win_end_s) / dt_s)))
+    if i1 <= i0:
+        return env.astype(np.float32), None, None
+
+    seg = env[i0:i1 + 1]
+    if seg.size == 0:
+        return env.astype(np.float32), None, None
+
+    peak_rel = int(np.argmax(seg))
+    peak_idx = i0 + peak_rel
+    peak_time_s = peak_idx * dt_s
+
+    onset_time_s: float | None = None
+    if onset_pct is not None:
+        pct = float(max(0.0, min(1.0, onset_pct)))
+        if noise_window_s is not None:
+            n0 = max(0, int(np.floor(float(noise_window_s[0]) / dt_s)))
+            n1 = min(x.size - 1, int(np.ceil(float(noise_window_s[1]) / dt_s)))
+            if n1 > n0:
+                noise_floor = float(np.median(env[n0:n1 + 1]))
+            else:
+                noise_floor = float(np.median(env[: max(1, i0)])) if i0 > 0 else 0.0
+        else:
+            noise_floor = float(np.median(env[: max(1, i0)])) if i0 > 0 else 0.0
+
+        thr = max(noise_floor, pct * float(env[peak_idx]))
+        for j in range(i0 + 1, peak_idx + 1):
+            if env[j] >= thr and env[j - 1] < thr:
+                y0 = float(env[j - 1])
+                y1 = float(env[j])
+                frac = 0.0 if abs(y1 - y0) < 1e-30 else (thr - y0) / (y1 - y0)
+                onset_time_s = ((j - 1) + frac) * dt_s
+                break
+
+    return env.astype(np.float32), float(peak_time_s), onset_time_s
+
+
 def apply_gain(
     data: Any,
     dt_s: float,
@@ -378,9 +696,10 @@ class FirstBreakPicker:
     Left click / drag: place picks
     Right click / drag: delete picks
     Shift + Left click: range-fill picks
-    a: STA/LTA auto-pick
-    f: filter on/off
+    a: auto-pick using selected mode
+    f: cycle filter mode (none/butter/ormsby)
     g: cycle gain (none -> norm -> agc)
+    o: cycle auto-pick mode (stalta/maxdiff_zero/hilbert_env)
     v: toggle display polarity
     l: toggle timeline guides
     c: top axis channel/offset
@@ -419,7 +738,7 @@ class FirstBreakPicker:
         self._saved = False
         self._cancelled = False
         self._done = False
-        self._filter_on = FILTER_ON
+        self._filter_mode = "ormsby" if FILTER_ON else "none"
         self._inverted = True
         self._top_mode = "channel"
         self.ax_top: Any = None
@@ -441,6 +760,22 @@ class FirstBreakPicker:
         self._f2 = BP_F2
         self._f3 = BP_F3
         self._f4 = BP_F4
+        self._butter_order = BUTTER_ORDER
+        self._filter_debounce_ms = max(0, int(FILTER_DEBOUNCE_MS))
+        self._filter_timer: Any = None
+        self._auto_pick_mode = str(AUTO_PICK_MODE).strip().lower()
+        self._pick_order = str(PICK_PROCESS_ORDER).strip().upper()
+        self._value_boxes: dict[str, Any] = {}
+        self._updating_value_box = False
+
+        self.data_ormsby = self.data_filt
+        self.data_butter = apply_butterworth_all_params(
+            self.data_raw,
+            self.dt_s,
+            low_hz=self._f2,
+            high_hz=self._f3,
+            order=self._butter_order,
+        )
 
         if existing_picks:
             self._picks = {int(k): float(v) for k, v in existing_picks.items()}
@@ -499,8 +834,7 @@ class FirstBreakPicker:
         self.ax_btn_auto = self.fig.add_axes([x0 + 0 * (row3_w + gap), 0.84, row3_w, row_h])
         self.ax_btn_inv = self.fig.add_axes([x0 + 1 * (row3_w + gap), 0.84, row3_w, row_h])
         self.ax_btn_tl = self.fig.add_axes([x0 + 2 * (row3_w + gap), 0.84, row3_w, row_h])
-
-        self.ax_btn_apply = self.fig.add_axes([x0 + 0.145, 0.505, 0.04, 0.022])
+        self.ax_btn_apply = self.fig.add_axes([x0 + 0.145, 0.412, 0.055, 0.024])
 
         btn_face = c["ax_bg"]
         btn_hover = "#e8e8e8" if THEME == "light" else "#2a2d3d"
@@ -512,7 +846,6 @@ class FirstBreakPicker:
         self.btn_inv = Button(self.ax_btn_inv, "", color=btn_face, hovercolor=btn_hover)
         self.btn_tl = Button(self.ax_btn_tl, "Timeline", color=btn_face, hovercolor=btn_hover)
         self.btn_apply = Button(self.ax_btn_apply, "Apply", color=btn_face, hovercolor=btn_hover)
-
         for btn in (
             self.btn_prev,
             self.btn_save,
@@ -536,12 +869,16 @@ class FirstBreakPicker:
         self.btn_auto.on_clicked(lambda _e: self._auto_then_redraw())
         self.btn_inv.on_clicked(lambda _e: self._toggle_invert())
         self.btn_tl.on_clicked(lambda _e: self._toggle_timelines())
-        self.btn_apply.on_clicked(lambda _e: self._apply_filter_controls())
+        self.btn_apply.on_clicked(lambda _e: self._apply_current_settings_to_picks())
 
-        self.fig.text(x0, 0.80, "Gain:", fontsize=8, fontweight="bold", color=c["text"])
-        self.fig.text(x0, 0.76, "AGC stat:", fontsize=8, fontweight="bold", color=c["text"])
-        self.fig.text(x0, 0.72, "Display:", fontsize=8, fontweight="bold", color=c["text"])
-        self.fig.text(x0, 0.602, "Filter (Hz)", fontsize=8, fontweight="bold", color=c["text"])
+        label_fs = 8
+        self.fig.text(x0, 0.80, "Gain Control:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.76, "AGC stat:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.72, "Display:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.620, "Filter mode:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.580, "Butter order:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.495, "Pick mode:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.455, "Reihenfolge:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
 
         self._gain_labels = ("none", "norm", "agc")
         self._gain_btns = self._make_mode_buttons(
@@ -561,7 +898,31 @@ class FirstBreakPicker:
             labels=self._disp_labels, callback=self._on_display_mode,
         )
 
-        self.ax_agc = self.fig.add_axes([x0 + 0.025, 0.67, 0.5 * w, 0.016], facecolor=c["ax_bg"])
+        self._filt_labels = ("none", "butter", "ormsby")
+        self._filt_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.620, w=0.145, h=0.026,
+            labels=self._filt_labels, callback=self._on_filter_mode,
+        )
+
+        self._butter_order_labels = ("2", "4", "6")
+        self._butter_order_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.580, w=0.095, h=0.026,
+            labels=self._butter_order_labels, callback=self._on_butter_order,
+        )
+
+        self._pick_mode_labels = ("stalta", "maxdiff_zero", "hilbert_env")
+        self._pick_mode_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.488, w=0.145, h=0.026,
+            labels=self._pick_mode_labels, callback=self._on_auto_pick_mode,
+        )
+
+        self._pick_order_labels = ("F>G>X", "G>F>X", "RAW>X")
+        self._pick_order_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.448, w=0.145, h=0.026,
+            labels=self._pick_order_labels, callback=self._on_pick_order,
+        )
+
+        self.ax_agc = self.fig.add_axes([x0 + 0.02, 0.67, 0.25 * w, 0.016], facecolor=c["ax_bg"])
         self.sl_agc = Slider(
             self.ax_agc,
             "AGC",
@@ -574,8 +935,9 @@ class FirstBreakPicker:
         self.sl_agc.label.set_fontsize(8)
         self.sl_agc.valtext.set_fontsize(8)
         self.sl_agc.on_changed(self._on_agc_window)
+        self._add_slider_value_box("agc", self.sl_agc, [0.855, 0.665, 0.04, 0.022], "{:.1f}")
 
-        self.ax_wig = self.fig.add_axes([x0 + 0.025, 0.64, 0.5 * w, 0.016], facecolor=c["ax_bg"])
+        self.ax_wig = self.fig.add_axes([x0 + 0.125, 0.67, 0.25 * w, 0.016], facecolor=c["ax_bg"])
         self.sl_wig = Slider(
             self.ax_wig,
             "Scale",
@@ -588,12 +950,13 @@ class FirstBreakPicker:
         self.sl_wig.label.set_fontsize(8)
         self.sl_wig.valtext.set_fontsize(8)
         self.sl_wig.on_changed(self._on_wiggle_stretch)
+        self._add_slider_value_box("scale", self.sl_wig, [0.96, 0.665, 0.04, 0.022], "{:.2f}")
 
-        self.fig.text(x0, 0.472, "Time View (ms)", fontsize=8, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.405, "Time View (ms)", fontsize=8, fontweight="bold", color=c["text"], ha="left", va="bottom")
         tmin_hi = max(self._t_full_start + 1.0, self._t_full_end - 1.0)
         tmax_lo = min(self._t_full_end - 1.0, self._t_full_start + 1.0)
-        self.ax_tmin = self.fig.add_axes([x0 + 0.025, 0.440, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_tmax = self.fig.add_axes([x0 + 0.025, 0.415, 0.1, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmin = self.fig.add_axes([x0 + 0.02, 0.375, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmax = self.fig.add_axes([x0 + 0.125, 0.375, 0.25 * w, 0.014], facecolor=c["ax_bg"])
         self.sl_tmin = Slider(self.ax_tmin, "T min", self._t_full_start, tmin_hi,
                       valinit=float(self._t_view_start), valstep=1.0)
         self.sl_tmax = Slider(self.ax_tmax, "T max", tmax_lo, self._t_full_end,
@@ -607,17 +970,25 @@ class FirstBreakPicker:
         self.sl_tmin.on_changed(self._on_tmin)
         self.sl_tmax.on_changed(self._on_tmax)
 
-        self.ax_f1 = self.fig.add_axes([x0 + 0.0125, 0.580, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f2 = self.fig.add_axes([x0 + 0.0125, 0.555, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f3 = self.fig.add_axes([x0 + 0.0125, 0.530, 0.1, 0.014], facecolor=c["ax_bg"])
-        self.ax_f4 = self.fig.add_axes([x0 + 0.0125, 0.505, 0.1, 0.014], facecolor=c["ax_bg"])
+        self.ax_f1 = self.fig.add_axes([x0 + 0.0125, 0.550, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f2 = self.fig.add_axes([x0 + 0.125, 0.550, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f3 = self.fig.add_axes([x0 + 0.0125, 0.525, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f4 = self.fig.add_axes([x0 + 0.125, 0.525, 0.25 * w, 0.014], facecolor=c["ax_bg"])
 
-        self.sl_f1 = Slider(self.ax_f1, "f1", 0.0, 50.0, valinit=float(self._f1), valstep=0.5)
-        self.sl_f2 = Slider(self.ax_f2, "f2", 0.5, 80.0, valinit=float(self._f2), valstep=0.5)
-        self.sl_f3 = Slider(self.ax_f3, "f3", 20.0, 220.0, valinit=float(self._f3), valstep=1.0)
-        self.sl_f4 = Slider(self.ax_f4, "f4", 40.0, 260.0, valinit=float(self._f4), valstep=1.0)
+        self.sl_f1 = Slider(self.ax_f1, "f1 ", 0.0, 50.0, valinit=float(self._f1), valstep=0.5)
+        self.sl_f2 = Slider(self.ax_f2, "f2 ", 0.5, 80.0, valinit=float(self._f2), valstep=0.5)
+        self.sl_f3 = Slider(self.ax_f3, "f3 ", 20.0, 220.0, valinit=float(self._f3), valstep=1.0)
+        self.sl_f4 = Slider(self.ax_f4, "f4 ", 40.0, 260.0, valinit=float(self._f4), valstep=1.0)
+        self.sl_f1.on_changed(self._on_filter_sliders)
+        self.sl_f2.on_changed(self._on_filter_sliders)
+        self.sl_f3.on_changed(self._on_filter_sliders)
+        self.sl_f4.on_changed(self._on_filter_sliders)
+        self._add_slider_value_box("f1", self.sl_f1, [0.855, 0.545, 0.04, 0.022], "{:.1f}")
+        self._add_slider_value_box("f2", self.sl_f2, [0.96, 0.545, 0.04, 0.022], "{:.1f}")
+        self._add_slider_value_box("f3", self.sl_f3, [0.855, 0.520, 0.04, 0.022], "{:.1f}")
+        self._add_slider_value_box("f4", self.sl_f4, [0.96, 0.520, 0.04, 0.022], "{:.1f}")
 
-        self.ax_info = self.fig.add_axes([x0, 0.125, w, 0.265], facecolor=c["ax_bg"])
+        self.ax_info = self.fig.add_axes([x0, 0.125, w, 0.23], facecolor=c["ax_bg"])
         self.ax_info.set_xticks([])
         self.ax_info.set_yticks([])
         for sp in self.ax_info.spines.values():
@@ -675,6 +1046,14 @@ class FirstBreakPicker:
             self._style_mode_buttons(self._stat_btns, self._stat_labels, self._agc_stat)
         if hasattr(self, "_disp_btns"):
             self._style_mode_buttons(self._disp_btns, self._disp_labels, self._display_mode)
+        if hasattr(self, "_filt_btns"):
+            self._style_mode_buttons(self._filt_btns, self._filt_labels, self._filter_mode)
+        if hasattr(self, "_butter_order_btns"):
+            self._style_mode_buttons(self._butter_order_btns, self._butter_order_labels, str(int(self._butter_order)))
+        if hasattr(self, "_pick_mode_btns"):
+            self._style_mode_buttons(self._pick_mode_btns, self._pick_mode_labels, self._auto_pick_mode)
+        if hasattr(self, "_pick_order_btns"):
+            self._style_mode_buttons(self._pick_order_btns, self._pick_order_labels, self._pick_order)
 
     def _refresh_toggle_buttons(self):
         c = _tc()
@@ -740,6 +1119,71 @@ class FirstBreakPicker:
         self._refresh_mode_buttons()
         self._redraw()
 
+    def _on_auto_pick_mode(self, label: str):
+        self._auto_pick_mode = str(label).strip().lower()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _on_pick_order(self, label: str):
+        self._pick_order = str(label).strip().upper()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _add_slider_value_box(self, name: str, slider: Any, rect: list[float], fmt: str):
+        axb = self.fig.add_axes(rect, facecolor="#ffffff" if THEME == "light" else "#202437")
+        tb = TextBox(axb, "", initial=fmt.format(float(slider.val)))
+        tb.text_disp.set_fontsize(8)
+        self._value_boxes[name] = (tb, slider, fmt)
+
+        def _submit(txt: str):
+            if self._updating_value_box:
+                return
+            s = str(txt).strip().replace(",", ".")
+            try:
+                v = float(s)
+            except Exception:
+                self._sync_value_box(name, float(slider.val))
+                return
+            lo = float(getattr(slider, "valmin", v))
+            hi = float(getattr(slider, "valmax", v))
+            v = max(lo, min(hi, v))
+            slider.set_val(v)
+            self._sync_value_box(name, v)
+
+        tb.on_submit(_submit)
+        slider.on_changed(lambda val, n=name: self._sync_value_box(n, float(val)))
+
+    def _sync_value_box(self, name: str, value: float):
+        if self._updating_value_box:
+            return
+        item = self._value_boxes.get(name)
+        if not item:
+            return
+        tb, _slider, fmt = item
+        try:
+            self._updating_value_box = True
+            tb.set_val(fmt.format(float(value)))
+        except Exception:
+            pass
+        finally:
+            self._updating_value_box = False
+
+    def _on_filter_mode(self, label: str):
+        self._filter_mode = str(label).lower()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _on_butter_order(self, label: str):
+        try:
+            order = int(str(label).strip())
+        except Exception:
+            return
+        if order < 1 or order == int(self._butter_order):
+            return
+        self._butter_order = int(order)
+        self._schedule_filter_update()
+        self._refresh_mode_buttons()
+
     def _toggle_invert(self):
         self._inverted = not self._inverted
         self._update_invert_button_label()
@@ -750,20 +1194,62 @@ class FirstBreakPicker:
         self._refresh_toggle_buttons()
         self._redraw()
 
-    def _apply_filter_controls(self):
+    def _schedule_filter_update(self):
+        if self._filter_debounce_ms <= 0:
+            self._apply_filter_update_now()
+            return
+
+        try:
+            if self._filter_timer is not None:
+                self._filter_timer.stop()
+        except Exception:
+            pass
+
+        self._filter_timer = self.fig.canvas.new_timer(interval=int(self._filter_debounce_ms))
+        self._filter_timer.single_shot = True
+        self._filter_timer.add_callback(self._apply_filter_update_now)
+        self._filter_timer.start()
+
+    def _apply_filter_update_now(self):
+        self._recompute_filter()
+        self._redraw()
+
+    def _apply_current_settings_to_picks(self):
+        """Re-snap all current picks using active pick mode/order and settings."""
+        if not self._picks:
+            print("     Apply: no picks to update.")
+            return
+        updated = 0
+        new_map: dict[int, float] = {}
+        for idx, t_old in self._picks.items():
+            t_new = round(float(self._snap_pick_time_ms(int(idx), float(t_old))), 2)
+            if self._t_view_start <= t_new <= self._t_view_end:
+                new_map[int(idx)] = t_new
+            else:
+                new_map[int(idx)] = float(t_old)
+            if abs(float(new_map[int(idx)]) - float(t_old)) > 1e-6:
+                updated += 1
+        self._picks = new_map
+        print(f"     Apply: updated {updated}/{len(self._picks)} picks using mode={self._auto_pick_mode}, order={self._pick_order}.")
+        self._redraw()
+
+    def _on_filter_sliders(self, _val: float):
         f1 = float(self.sl_f1.val)
         f2 = float(self.sl_f2.val)
         f3 = float(self.sl_f3.val)
         f4 = float(self.sl_f4.val)
         if not (f1 < f2 < f3 < f4):
-            print("     [WARN] Need f1 < f2 < f3 < f4")
             return
         self._f1, self._f2, self._f3, self._f4 = f1, f2, f3, f4
-        self._recompute_filter()
-        self._redraw()
+        self._schedule_filter_update()
 
     def _active_data(self) -> Any:
-        d = self.data_filt if self._filter_on else self.data_raw
+        if self._filter_mode == "ormsby":
+            d = self.data_ormsby
+        elif self._filter_mode == "butter":
+            d = self.data_butter
+        else:
+            d = self.data_raw
         d = apply_gain(
             d,
             self.dt_s,
@@ -774,7 +1260,95 @@ class FirstBreakPicker:
         return -d if self._inverted else d
 
     def _recompute_filter(self):
-        self.data_filt = apply_ormsby_all_params(self.data_raw, self.dt_s, self._f1, self._f2, self._f3, self._f4)
+        self.data_ormsby = apply_ormsby_all_params(
+            self.data_raw,
+            self.dt_s,
+            self._f1,
+            self._f2,
+            self._f3,
+            self._f4,
+        )
+        self.data_butter = apply_butterworth_all_params(
+            self.data_raw,
+            self.dt_s,
+            low_hz=self._f2,
+            high_hz=self._f3,
+            order=self._butter_order,
+        )
+
+    def _apply_gain_single(self, trace: Any) -> Any:
+        arr = np.asarray(trace, dtype=np.float32)[None, :]
+        return apply_gain(
+            arr,
+            self.dt_s,
+            mode=self._gain_mode,
+            window_ms=self._agc_window_ms,
+            stat=self._agc_stat,
+        )[0]
+
+    def _apply_filter_single(self, trace: Any) -> Any:
+        x = np.asarray(trace, dtype=np.float32)
+        if self._filter_mode == "ormsby":
+            return ormsby(x, self.dt_s, f1=self._f1, f2=self._f2, f3=self._f3, f4=self._f4)
+        if self._filter_mode == "butter":
+            return butterworth_bandpass(x, self.dt_s, low_hz=self._f2, high_hz=self._f3, order=self._butter_order)
+        return x
+
+    def _prepare_trace_for_pick(self, trace: Any) -> Any:
+        x = np.asarray(trace, dtype=np.float32)
+        if self._pick_order == "G>F>X":
+            x = self._apply_gain_single(x)
+            x = self._apply_filter_single(x)
+        elif self._pick_order == "RAW>X":
+            x = x
+        else:
+            x = self._apply_filter_single(x)
+            x = self._apply_gain_single(x)
+        if self._inverted:
+            x = -x
+        return np.asarray(x, dtype=np.float32)
+
+    def _snap_pick_time_ms(self, idx: int, t_hint_ms: float) -> float:
+        mode = str(self._auto_pick_mode).strip().lower()
+        if mode == "stalta":
+            return float(t_hint_ms)
+
+        tr = self._prepare_trace_for_pick(self.data_raw[idx])
+        t_rel_hint_s = (float(t_hint_ms) - float(self.delay_ms)) / 1000.0
+        half_win_s = max(self.dt_s, float(MANUAL_SNAP_WIN_MS) / 1000.0)
+        t0 = max(0.0, t_rel_hint_s - half_win_s)
+        t1 = min((self.n_samp - 1) * self.dt_s, t_rel_hint_s + half_win_s)
+        if t1 <= t0:
+            return float(t_hint_ms)
+
+        if mode == "maxdiff_zero":
+            ts = _zero_crossing_from_extremum_samples(
+                samples=tr,
+                dt_s=self.dt_s,
+                win_start_s=t0,
+                win_end_s=t1,
+                search_direction=ZERO_X_SEARCH_DIRECTION,
+                use_abs_peak=True,
+            )
+            if ts is None:
+                return float(t_hint_ms)
+            return float(self.delay_ms + 1000.0 * ts)
+
+        if mode == "hilbert_env":
+            tr_obj = Trace(data=np.asarray(tr, dtype=np.float32))
+            tr_obj.stats.delta = float(self.dt_s)
+            _env, t_peak, t_onset = hilbert_envelope_pick(
+                trace=tr_obj,
+                win_start_s=t0,
+                win_end_s=t1,
+                onset_pct=HILBERT_ONSET_PCT,
+            )
+            ts = t_onset if t_onset is not None else t_peak
+            if ts is None:
+                return float(t_hint_ms)
+            return float(self.delay_ms + 1000.0 * float(ts))
+
+        return float(t_hint_ms)
 
     def _draw_traces(self):
         c = _tc()
@@ -881,15 +1455,18 @@ class FirstBreakPicker:
         dt_ms = self.dt_s * 1000.0
         n_samp = self.n_samp
         t_end = self.delay_ms + (n_samp - 1) * dt_ms
-        filt_str = (
-            f"Ormsby {self._f1:.0f}-{self._f2:.0f}-{self._f3:.0f}-{self._f4:.0f} Hz "
-            + ("ON" if self._filter_on else "OFF")
-            + (" [INV]" if self._inverted else "")
-        )
+        if self._filter_mode == "ormsby":
+            filt_str = f"Ormsby {self._f1:.0f}-{self._f2:.0f}-{self._f3:.0f}-{self._f4:.0f} Hz"
+        elif self._filter_mode == "butter":
+            filt_str = f"Butterworth order {self._butter_order} ({self._f2:.0f}-{self._f3:.0f} Hz)"
+        else:
+            filt_str = "Filter none"
+        if self._inverted:
+            filt_str += " [INV]"
         title = (
             f"Profile {self.profile} | Shot {self.shot_id} | {n_samp} smp "
             f"dt={dt_ms:.4f} ms delay={self.delay_ms:.1f} ms end={t_end:.1f} ms "
-            f"| {len(self._picks)}/{self.n_traces} picks | {filt_str} | gain={self._gain_mode}"
+            f"| {len(self._picks)}/{self.n_traces} picks | {filt_str} | gain={self._gain_mode} | mode={self._auto_pick_mode} | order={self._pick_order}"
         )
         self.ax.set_title(title, color=c["text"], fontsize=9)
         self.ax.set_xlabel("Receiver position (m)", color=c["label"], fontsize=8)
@@ -898,7 +1475,7 @@ class FirstBreakPicker:
         self.ax.text(
             0.0,
             -0.14,
-            "L:pick R:delete Shift+L:range a:auto f:filter g:gain v:polarity l:timeline c:top axis s/n:save+next p:prev q:quit",
+            "L:pick R:delete Shift+L:range a:auto x:apply f:filter g:gain o:mode r:order v:polarity l:timeline c:top axis s/n:save+next p:prev q:quit",
             transform=self.ax.transAxes,
             ha="left",
             va="top",
@@ -959,7 +1536,11 @@ class FirstBreakPicker:
             f"Shot (m)       : {self.shot_pos_m:.2f}\n"
             f"Gain           : {self._gain_mode} ({self._agc_stat}, {self._agc_window_ms:.0f} ms)\n"
             f"Display / Scale: {self._display_mode} / {self._wiggle_stretch:.2f}\n"
-            f"Filter (Hz)    : {self._f1:.1f}-{self._f2:.1f}-{self._f3:.1f}-{self._f4:.1f}\n"
+            f"Auto mode      : {self._auto_pick_mode}\n"
+            f"Pick order      : {self._pick_order}\n"
+            f"Filter mode    : {self._filter_mode}\n"
+            f"Ormsby (Hz)    : {self._f1:.1f}-{self._f2:.1f}-{self._f3:.1f}-{self._f4:.1f}\n"
+            f"Butter (Hz)    : {self._f2:.1f}-{self._f3:.1f} (order {self._butter_order})\n"
             f"Time view (ms) : {self._t_view_start:.1f} .. {self._t_view_end:.1f}\n"
             f"Polarity       : {'inverse' if self._inverted else 'normal'}\n"
             f"Timelines      : {'on' if self._show_timelines else 'off'}"
@@ -995,7 +1576,7 @@ class FirstBreakPicker:
             return
 
         if event.button == 1:
-            t = round(float(ydata), 2)
+            t = round(float(self._snap_pick_time_ms(idx, float(ydata))), 2)
             if self._t_view_start <= t <= self._t_view_end:
                 self._picks[idx] = t
                 self._drag_pick = True
@@ -1026,7 +1607,7 @@ class FirstBreakPicker:
         idx = self._nearest_idx(xdata)
 
         if self._drag_pick:
-            t = round(float(ydata), 2)
+            t = round(float(self._snap_pick_time_ms(idx, float(ydata))), 2)
             if self._last_drag_idx is None:
                 if self._t_view_start <= t <= self._t_view_end:
                     self._picks[idx] = t
@@ -1145,27 +1726,42 @@ class FirstBreakPicker:
         elif key == "k":
             self._save_qc_image()
         elif key == "f":
-            self._filter_on = not self._filter_on
+            self._filter_mode = {"none": "butter", "butter": "ormsby", "ormsby": "none"}.get(self._filter_mode, "none")
+            self._refresh_mode_buttons()
             self._redraw()
         elif key == "u":
             self._f2 = max(self._f1 + 0.5, self._f2 + 1.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "j":
             self._f2 = max(self._f1 + 0.5, self._f2 - 1.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "i":
             self._f3 = min(self._f4 - 1.0, self._f3 + 5.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "m":
             self._f3 = max(self._f2 + 1.0, self._f3 - 5.0)
-            self._recompute_filter()
-            self._redraw()
+            self._schedule_filter_update()
         elif key == "g":
             self._gain_mode = {"none": "norm", "norm": "agc", "agc": "none"}.get(self._gain_mode, "none")
             self._redraw()
+        elif key == "o":
+            self._auto_pick_mode = {
+                "stalta": "maxdiff_zero",
+                "maxdiff_zero": "hilbert_env",
+                "hilbert_env": "stalta",
+            }.get(self._auto_pick_mode, "stalta")
+            self._refresh_mode_buttons()
+            self._redraw()
+        elif key == "r":
+            self._pick_order = {
+                "F>G>X": "G>F>X",
+                "G>F>X": "RAW>X",
+                "RAW>X": "F>G>X",
+            }.get(self._pick_order, "F>G>X")
+            self._refresh_mode_buttons()
+            self._redraw()
+        elif key == "x":
+            self._apply_current_settings_to_picks()
         elif key == "v":
             self._toggle_invert()
         elif key == "l":
@@ -1181,6 +1777,16 @@ class FirstBreakPicker:
             self._redraw()
 
     def _auto_pick(self):
+        mode = str(self._auto_pick_mode).strip().lower()
+        if mode == "maxdiff_zero":
+            self._auto_pick_maxdiff_zero()
+            return
+        if mode == "hilbert_env":
+            self._auto_pick_hilbert_env()
+            return
+        self._auto_pick_stalta()
+
+    def _auto_pick_stalta(self):
         data = self._active_data()
         count = 0
         n_sta = max(1, int(STA_MS / 1000.0 / self.dt_s))
@@ -1222,7 +1828,51 @@ class FirstBreakPicker:
                 self._picks[i] = t_abs
                 count += 1
 
-        print(f"     Auto-pick: {count}/{self.n_traces} placed")
+        print(f"     Auto-pick (stalta): {count}/{self.n_traces} placed")
+
+    def _auto_pick_maxdiff_zero(self):
+        count = 0
+        win_start_s = max(0.0, self._t_view_start / 1000.0)
+        win_end_s = max(win_start_s + self.dt_s, self._t_view_end / 1000.0)
+        for i in range(self.n_traces):
+            tr = self._prepare_trace_for_pick(self.data_raw[i])
+            t_s = _zero_crossing_from_extremum_samples(
+                samples=tr,
+                dt_s=self.dt_s,
+                win_start_s=win_start_s,
+                win_end_s=win_end_s,
+                search_direction=ZERO_X_SEARCH_DIRECTION,
+                use_abs_peak=True,
+            )
+            if t_s is None:
+                continue
+            t_abs = round(self.delay_ms + (t_s * 1000.0), 2)
+            if self._t_view_start <= t_abs <= self._t_view_end:
+                self._picks[i] = t_abs
+                count += 1
+        print(f"     Auto-pick (maxdiff_zero): {count}/{self.n_traces} placed")
+
+    def _auto_pick_hilbert_env(self):
+        count = 0
+        win_start_s = max(0.0, self._t_view_start / 1000.0)
+        win_end_s = max(win_start_s + self.dt_s, self._t_view_end / 1000.0)
+        for i in range(self.n_traces):
+            tr = Trace(data=np.asarray(self._prepare_trace_for_pick(self.data_raw[i]), dtype=np.float32))
+            tr.stats.delta = float(self.dt_s)
+            _, peak_time_s, onset_time_s = hilbert_envelope_pick(
+                trace=tr,
+                win_start_s=win_start_s,
+                win_end_s=win_end_s,
+                onset_pct=HILBERT_ONSET_PCT,
+            )
+            t_s = onset_time_s if onset_time_s is not None else peak_time_s
+            if t_s is None:
+                continue
+            t_abs = round(self.delay_ms + (float(t_s) * 1000.0), 2)
+            if self._t_view_start <= t_abs <= self._t_view_end:
+                self._picks[i] = t_abs
+                count += 1
+        print(f"     Auto-pick (hilbert_env): {count}/{self.n_traces} placed")
 
     def _save_qc_image(self):
         self.qc_dir.mkdir(parents=True, exist_ok=True)
@@ -1337,9 +1987,10 @@ def clear_session_picks_json(profile_name: str):
 
 def process_profile(profile_name: str, geom_override: int | None = None):
     cfg = PROFILES.get(profile_name)
+    has_profile_cfg = cfg is not None
     if cfg is None:
-        print(f"[ERROR] Profile '{profile_name}' not in PROFILES. Known: {list(PROFILES)}")
-        return
+        cfg = {"geom": 100, "line_no": profile_name, "perp_m": 0.0, "shots": "auto"}
+        print(f"  [INFO] Profile '{profile_name}' not in PROFILES; using dynamic defaults.")
 
     data_dir = DATA_DIR / profile_name
     if not data_dir.exists():
@@ -1349,7 +2000,26 @@ def process_profile(profile_name: str, geom_override: int | None = None):
     if not _ensure_interactive_backend():
         return
 
-    geom_type = int(geom_override) if geom_override is not None else int(cfg["geom"])
+    geom_type: int
+    geom_src: str
+    if geom_override is not None:
+        geom_type = int(geom_override)
+        geom_src = "CLI"
+    elif has_profile_cfg and cfg.get("geom") in (100, 200):
+        geom_type = int(cfg.get("geom"))
+        geom_src = "profile config"
+    else:
+        geom_xls, xls_path, xls_dist = infer_geometry_from_lvl_excel(DATA_DIR, profile_name)
+        if geom_xls in (100, 200):
+            geom_type = int(geom_xls)
+            if xls_path is not None and xls_dist is not None:
+                geom_src = f"excel ({xls_path.name}, dist~{xls_dist:.2f} m)"
+            else:
+                geom_src = "excel"
+        else:
+            geom_type = 100
+            geom_src = "default"
+
     recv_positions = load_geometry(geom_type)
 
     shots_cfg = cfg.get("shots", "auto")
@@ -1358,7 +2028,7 @@ def process_profile(profile_name: str, geom_override: int | None = None):
 
     print(
         f"  Geometry {geom_type} m : {len(recv_positions)} receivers, "
-        f"{recv_positions[0]:.2f} - {recv_positions[-1]:.2f} m"
+        f"{recv_positions[0]:.2f} - {recv_positions[-1]:.2f} m ({geom_src})"
     )
     print(
         "  Shot positions: "
@@ -1524,7 +2194,7 @@ def main():
     )
     parser.add_argument("profile", nargs="?", default=None, help="Profile folder name, e.g. 120")
     parser.add_argument("geometry", nargs="?", default=None, help="Optional geometry override: 100 or 200")
-    parser.add_argument("--all", action="store_true", help="Process all profiles in PROFILES")
+    parser.add_argument("--all", action="store_true", help="Process all profile folders detected under data/")
     args = parser.parse_args()
 
     geom_override: int | None = None
@@ -1541,7 +2211,10 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.all:
-        targets = list(PROFILES)
+        targets = discover_profile_folders(DATA_DIR)
+        if not targets:
+            print("[ERROR] No profile folders with SEG2 files found under data/.")
+            return
     elif args.profile:
         targets = [args.profile]
     else:
@@ -1564,11 +2237,14 @@ def main():
             print("\nAvailable profiles:")
             print(f"  {'Name':<12}  {'Geom':>6}  Data folder")
             print(f"  {'-' * 12}  {'-' * 6}  {'-' * 30}")
-            for pname, pcfg in PROFILES.items():
+            dynamic_profiles = discover_profile_folders(DATA_DIR)
+            if not dynamic_profiles:
+                print("  (none found)")
+            for pname in dynamic_profiles:
+                pcfg = PROFILES.get(pname, {"geom": 100})
                 folder = DATA_DIR / pname
-                status = "found" if folder.exists() else "MISSING"
-                n_seg2 = len(list(folder.glob("*.seg2"))) if folder.exists() else 0
-                print(f"  {pname:<12}  {pcfg['geom']:>5}m  {status} ({n_seg2} SEG2 files)")
+                n_seg2 = len(list(folder.glob("*.seg2"))) + len(list(folder.glob("*.SEG2")))
+                print(f"  {pname:<12}  {int(pcfg.get('geom', 100)):>5}m  found ({n_seg2} SEG2 files)")
             print("\nUsage: python fb_picker.py <profile> [geometry]")
             return
 
