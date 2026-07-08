@@ -581,6 +581,25 @@ def export_velocity_summary_excel(profile_name: str,
         for ci, h in enumerate(headers, start=1):
             _chdr(ws, 1, ci, h)
 
+    def _highlight_summary_headers() -> None:
+        # Emphasize average/depth/intercept-time fields in the summary header row.
+        target_headers = {
+            "V0A", "V1A", "V2A",
+            "t1_ms", "t2_ms",
+            "D1_m", "D2_m", "D1_plus_D2_m",
+        }
+        fill = PatternFill("solid", fgColor="FFD966")
+        font = Font(bold=True, color="000000")
+        for ci in range(1, ws.max_column + 1):
+            hv = ws.cell(row=1, column=ci).value
+            if str(hv).strip() in target_headers:
+                cell = ws.cell(row=1, column=ci)
+                cell.fill = fill
+                cell.font = font
+                cell.alignment = Alignment(horizontal="center")
+
+    _highlight_summary_headers()
+
     shot_pos_by_id = {int(sid): float(pos) for sid, pos in shots_info}
     shot_ids = sorted(shot_pos_by_id, key=lambda sid: shot_pos_by_id[sid])
     sid_l = shot_ids[0] if shot_ids else None
@@ -606,7 +625,8 @@ def export_velocity_summary_excel(profile_name: str,
     d2 = float(avg.get("h2_m", 0.0) or 0.0)
 
     # Use the profile token as the exported line label (e.g., "150" instead of legacy numeric ids).
-    line_val = str(profile_name)
+    line_val = str(profile_name).strip()
+    line_new_val = f"{line_val}_new"
     length_m = float(abs(float(recv_positions[-1]) - float(recv_positions[0]))) if len(recv_positions) >= 2 else 0.0
     station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
     x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
@@ -644,14 +664,28 @@ def export_velocity_summary_excel(profile_name: str,
 
     profile_col = 1
     legacy_line_val = cfg.get("line_no", None)
-    target_row = None
+    row_base = None
+    row_new = None
+    row_legacy = None
     for rr in range(2, ws.max_row + 1):
         val = ws.cell(row=rr, column=profile_col).value
         val_s = str(val).strip()
-        if val_s == str(line_val).strip() or (legacy_line_val is not None and val_s == str(legacy_line_val).strip()):
-            target_row = rr
-    if target_row is None:
-        target_row = ws.max_row + 1
+        if val_s == line_val:
+            row_base = rr
+        elif val_s == line_new_val:
+            row_new = rr
+        elif legacy_line_val is not None and val_s == str(legacy_line_val).strip():
+            row_legacy = rr
+
+    base_exists = (row_base is not None) or (row_legacy is not None)
+    if base_exists:
+        # Keep the original/base row intact; update/create the "_new" row.
+        row[0] = line_new_val
+        target_row = row_new if row_new is not None else (ws.max_row + 1)
+    else:
+        # No base row yet: write/update canonical row by profile token.
+        row[0] = line_val
+        target_row = row_base if row_base is not None else (ws.max_row + 1)
 
     for ci, vv in enumerate(row, start=1):
         ws.cell(row=target_row, column=ci, value=vv)
@@ -1834,14 +1868,19 @@ def depth_3layer(ti2_ms: float, V1: float, V2: float,
     Intercept-time depth to second refractor, 3-layer model.
     Accounts for first-layer delay time.  Returns None if geometry is invalid.
     """
-    if V3 <= V2 or V2 <= V1 or V1 <= 0.0:
+    if V3 <= V2 or V2 <= V1 or V1 <= 0.0 or h1 is None or h1 <= 0.0:
         return None
-    cos_ic12 = math.sqrt(max(0.0, 1.0 - (V1 / V2) ** 2))
-    delay_ms = 2.0 * h1 * cos_ic12 / V1 * 1000.0
-    ti2_eff  = ti2_ms - delay_ms
+    # Match the standard 3-layer intercept-time formulation used in project spreadsheets:
+    # h2 = V2 * (ti2 - 2*h1*cos(arcsin(V1/V3))/V1) / (2000 * cos(arcsin(V2/V3)))
+    cos_i13 = math.sqrt(max(0.0, 1.0 - (V1 / V3) ** 2))
+    cos_i23 = math.sqrt(max(0.0, 1.0 - (V2 / V3) ** 2))
+    if cos_i23 <= 0.0:
+        return None
+    delay_ms = 2.0 * h1 * cos_i13 / V1 * 1000.0
+    ti2_eff = ti2_ms - delay_ms
     if ti2_eff <= 0.0:
         return None
-    return (ti2_eff / 1000.0) * V1 * V3 / (2.0 * math.sqrt(V3 ** 2 - V1 ** 2))
+    return (V2 * ti2_eff) / (2000.0 * cos_i23)
 
 
 def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
