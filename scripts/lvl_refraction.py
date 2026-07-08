@@ -1,4 +1,4 @@
-"""
+﻿"""
 lvl_refraction.py  --  First-break picking + LVL refraction analysis
 ====================================================================
 Project : Low Velocity Layer (LVL) refraction seismic surveys
@@ -97,11 +97,11 @@ _ensure("openpyxl")
 _ensure("scipy")
 _ensure("xlrd")
 
-from obspy import read as _read_obspy          # type: ignore[import-untyped]
+from obspy import Trace, read as _read_obspy          # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, Slider, TextBox
-from scipy.signal import butter as _scipy_butter, sosfiltfilt as _scipy_sosfiltfilt
+from scipy.signal import butter as _scipy_butter, hilbert as _scipy_hilbert, sosfiltfilt as _scipy_sosfiltfilt
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
@@ -127,7 +127,7 @@ GEOM_FILES: dict = {
 # Profile registry
 # ---------------------------------------------------------------------------
 # geom    : geometry type (100 or 200)
-# line_no : line identifier used for labelling
+# line_no : legacy numeric identifier (kept for backward compatibility)
 # perp_m  : perpendicular distance of shot from the geophone line (m)
 # shots   : {shot_id: inline_position_m}  OR  "auto"
 #           "auto" = derive from geometry:
@@ -183,6 +183,7 @@ T_MAX_MS: float    = 150.0    # end of display window (ms from trigger)
 T_DISPLAY_PRE_MS: float = -10.0  # ms before trigger to show (headroom above first arrivals)
 CLIP_FACTOR: float = 2.0      # wiggle clip level in std-dev multiples
 FILTER_ON: bool    = True     # start with filter active
+DEFAULT_FILTER_MODE: str = "butter"  # "none" | "butter" | "ormsby" | "cutpass"
 DISPLAY_MODE: str  = "wiggle"   # "wiggle" | "vd" | "both"
 SHOW_TIMELINES: bool = True
 WIGGLE_STRETCH: float = 1.0
@@ -200,6 +201,25 @@ AGC_STAT: str         = "rms"    # "mean" | "rms"
 STA_MS: float      = 3.0
 LTA_MS: float      = 20.0
 STALTA_TRIG: float = 3.0
+AUTO_PICK_MODE: str = "hilbert_env"  # "stalta" | "maxdiff_zero" | "hilbert_env"
+ZERO_X_SEARCH_DIRECTION: str = "backward"  # "backward" | "forward"
+HILBERT_ONSET_PCT: float = 0.08  # Fraction of peak envelope amplitude for onset pick (0.0-1.0)
+HILBERT_TARGET: str = "onset"  # "onset" | "peak"
+PICK_PROCESS_ORDER: str = "F>G>X"  # "F>G>X" | "G>F>X" | "RAW>X"
+MANUAL_SNAP_WIN_MS: float = 6.0  # Manual pick snap window for zero-crossing search (ms)
+# Auto-pick first-arrival plausibility gate (absolute time, ms)
+AUTO_USE_VELOCITY_GATE: bool = True
+AUTO_VMIN_M_S: float = 120.0
+AUTO_VMAX_M_S: float = 3500.0
+AUTO_GATE_PAD_MS: float = 20.0
+
+# ---------------------------------------------------------------------------
+# Trigger/radio correction (ms)
+# Static term is added to SEG2 delay when data are loaded so display and picks
+# share the same time basis. Optional linear term is applied per trace offset.
+# ---------------------------------------------------------------------------
+TRIGGER_STATIC_MS: float = 6.0
+TRIGGER_MS_PER_M: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Refraction analysis
@@ -539,7 +559,7 @@ def export_velocity_summary_excel(profile_name: str,
                                   analysis: dict,
                                   output_dir: Path,
                                   geometry_excel_paths: list | None = None,
-                                  filename: str = "LVL_velocity_summary.xlsx") -> Path:
+                                  filename: str = "lvl_velocity_summary.xlsx") -> Path:
     """Write/append one profile row to a consolidated velocity summary workbook."""
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / filename
@@ -585,7 +605,8 @@ def export_velocity_summary_excel(profile_name: str,
     d1 = float(avg.get("h1_m", 0.0) or 0.0)
     d2 = float(avg.get("h2_m", 0.0) or 0.0)
 
-    line_val = cfg.get("line_no", profile_name)
+    # Use the profile token as the exported line label (e.g., "150" instead of legacy numeric ids).
+    line_val = str(profile_name)
     length_m = float(abs(float(recv_positions[-1]) - float(recv_positions[0]))) if len(recv_positions) >= 2 else 0.0
     station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
     x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
@@ -622,10 +643,12 @@ def export_velocity_summary_excel(profile_name: str,
     ]
 
     profile_col = 1
+    legacy_line_val = cfg.get("line_no", None)
     target_row = None
     for rr in range(2, ws.max_row + 1):
         val = ws.cell(row=rr, column=profile_col).value
-        if str(val).strip() == str(line_val).strip():
+        val_s = str(val).strip()
+        if val_s == str(line_val).strip() or (legacy_line_val is not None and val_s == str(legacy_line_val).strip()):
             target_row = rr
     if target_row is None:
         target_row = ws.max_row + 1
@@ -1407,9 +1430,9 @@ def read_seg2(path: Path) -> tuple:
         if ssn.isdigit():
             ffid = int(ssn)
 
-        # DELAY is stored in seconds; convert to ms
+        # DELAY is stored in seconds; convert to ms and include trigger static.
         delay_str = str(hdr0.get("DELAY", "0")).strip()
-        delay_ms  = float(delay_str.replace(",", ".")) * 1000.0
+        delay_ms  = float(delay_str.replace(",", ".")) * 1000.0 + float(TRIGGER_STATIC_MS)
 
         # RECEIVER_LOCATION per trace (m along profile)
         locs = []
@@ -1521,6 +1544,185 @@ def apply_butterworth_all_params(data: Any, dt_s: float,
     for i in range(data.shape[0]):
         out[i] = butterworth_bandpass(data[i], dt_s, low_hz=low_hz, high_hz=high_hz, order=order)
     return out
+
+
+def butterworth_highpass(trace: Any, dt_s: float, low_hz: float, order: int = BUTTER_ORDER) -> Any:
+    """Zero-phase Butterworth high-pass (low-cut)."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size < 8:
+        return np.asarray(trace, dtype=np.float32)
+    fs = 1.0 / max(float(dt_s), 1e-12)
+    nyq = 0.5 * fs
+    lo = max(0.001, min(float(low_hz), nyq * 0.999))
+    if not (0.0 < lo < nyq):
+        return np.asarray(trace, dtype=np.float32)
+    sos = _scipy_butter(int(max(1, order)), lo, btype="highpass", fs=fs, output="sos")
+    try:
+        y = _scipy_sosfiltfilt(sos, x)
+    except Exception:
+        y = x
+    return np.asarray(y, dtype=np.float32)
+
+
+def butterworth_lowpass(trace: Any, dt_s: float, high_hz: float, order: int = BUTTER_ORDER) -> Any:
+    """Zero-phase Butterworth low-pass (high-cut)."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size < 8:
+        return np.asarray(trace, dtype=np.float32)
+    fs = 1.0 / max(float(dt_s), 1e-12)
+    nyq = 0.5 * fs
+    hi = max(0.001, min(float(high_hz), nyq * 0.999))
+    if not (0.0 < hi < nyq):
+        return np.asarray(trace, dtype=np.float32)
+    sos = _scipy_butter(int(max(1, order)), hi, btype="lowpass", fs=fs, output="sos")
+    try:
+        y = _scipy_sosfiltfilt(sos, x)
+    except Exception:
+        y = x
+    return np.asarray(y, dtype=np.float32)
+
+
+def apply_cutpass_all_params(data: Any, dt_s: float,
+                             low_cut_hz: float, high_cut_hz: float,
+                             order: int = BUTTER_ORDER) -> Any:
+    """Apply low-cut then high-cut (high-pass + low-pass) to all traces."""
+    out = np.empty_like(data)
+    for i in range(data.shape[0]):
+        y = butterworth_highpass(data[i], dt_s, low_hz=low_cut_hz, order=order)
+        y = butterworth_lowpass(y, dt_s, high_hz=high_cut_hz, order=order)
+        out[i] = y
+    return out
+
+
+def _zero_crossing_from_extremum_samples(
+    samples: Any,
+    dt_s: float,
+    win_start_s: float,
+    win_end_s: float,
+    search_direction: str = "backward",
+    use_abs_peak: bool = True,
+) -> float | None:
+    """Return zero-crossing time (s) near local extremum in a window."""
+    x = np.asarray(samples, dtype=float)
+    if x.size < 2:
+        return None
+
+    i0 = max(0, int(np.floor(win_start_s / dt_s)))
+    i1 = min(x.size - 1, int(np.ceil(win_end_s / dt_s)))
+    if i1 <= i0:
+        return None
+
+    seg = x[i0:i1 + 1]
+    if seg.size == 0:
+        return None
+
+    if use_abs_peak:
+        rel_idx = int(np.argmax(np.abs(seg)))
+    else:
+        rel_idx = int(np.argmax(seg))
+    peak_idx = i0 + rel_idx
+
+    direction = str(search_direction).strip().lower()
+    if direction not in {"backward", "forward"}:
+        direction = "backward"
+
+    if direction == "backward":
+        if x[peak_idx] == 0.0:
+            return peak_idx * dt_s
+        for right in range(peak_idx, i0, -1):
+            left = right - 1
+            y0 = float(x[left])
+            y1 = float(x[right])
+            if y0 == 0.0:
+                return left * dt_s
+            if y1 == 0.0:
+                return right * dt_s
+            if y0 * y1 < 0.0:
+                frac = -y0 / (y1 - y0)
+                return (left + frac) * dt_s
+    else:
+        if x[peak_idx] == 0.0:
+            return peak_idx * dt_s
+        for left in range(peak_idx, i1):
+            right = left + 1
+            y0 = float(x[left])
+            y1 = float(x[right])
+            if y0 == 0.0:
+                return left * dt_s
+            if y1 == 0.0:
+                return right * dt_s
+            if y0 * y1 < 0.0:
+                frac = -y0 / (y1 - y0)
+                return (left + frac) * dt_s
+
+    return peak_idx * dt_s
+
+
+def hilbert_envelope_pick(
+    trace: Trace,
+    win_start_s: float,
+    win_end_s: float,
+    onset_pct: float | None = HILBERT_ONSET_PCT,
+    noise_window_s: tuple[float, float] | None = None,
+) -> tuple[Any, float | None, float | None]:
+    """
+    Compute Hilbert envelope and pick arrival in a time window.
+
+    Returns
+    -------
+    envelope : ndarray
+        Instantaneous amplitude envelope (same sample length as input trace).
+    peak_time_s : float | None
+        Time of envelope maximum in the search window (seconds from trace start).
+    onset_time_s : float | None
+        Optional onset time where envelope first exceeds threshold before peak.
+    """
+    x = np.asarray(trace.data, dtype=float)
+    if x.size < 2:
+        return np.asarray([], dtype=np.float32), None, None
+
+    dt_s = float(trace.stats.delta)
+    env = np.abs(_scipy_hilbert(x))
+
+    i0 = max(0, int(np.floor(float(win_start_s) / dt_s)))
+    i1 = min(x.size - 1, int(np.ceil(float(win_end_s) / dt_s)))
+    if i1 <= i0:
+        return env.astype(np.float32), None, None
+
+    seg = env[i0:i1 + 1]
+    if seg.size == 0:
+        return env.astype(np.float32), None, None
+
+    peak_rel = int(np.argmax(seg))
+    peak_idx = i0 + peak_rel
+    peak_time_s = peak_idx * dt_s
+
+    onset_time_s: float | None = None
+    if onset_pct is not None:
+        pct = float(max(0.0, min(1.0, onset_pct)))
+        if noise_window_s is not None:
+            n0 = max(0, int(np.floor(float(noise_window_s[0]) / dt_s)))
+            n1 = min(x.size - 1, int(np.ceil(float(noise_window_s[1]) / dt_s)))
+            if n1 > n0:
+                noise_floor = float(np.median(env[n0:n1 + 1]))
+            else:
+                noise_floor = float(np.median(env[: max(1, i0)])) if i0 > 0 else 0.0
+        else:
+            noise_floor = float(np.median(env[: max(1, i0)])) if i0 > 0 else 0.0
+
+        peak_val = float(env[peak_idx])
+        thr = noise_floor + pct * max(0.0, peak_val - noise_floor)
+        for j in range(i0 + 1, peak_idx + 1):
+            if env[j] >= thr and env[j - 1] < thr:
+                y0 = float(env[j - 1])
+                y1 = float(env[j])
+                frac = 0.0 if abs(y1 - y0) < 1e-30 else (thr - y0) / (y1 - y0)
+                onset_time_s = ((j - 1) + frac) * dt_s
+                break
+        if onset_time_s is None:
+            onset_time_s = float(i0 * dt_s)
+
+    return env.astype(np.float32), float(peak_time_s), onset_time_s
 
 
 # ---------------------------------------------------------------------------
@@ -1649,8 +1851,9 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
             x1-x2 -> layer 1
             x3-x4 -> layer 2
             x5-x6 -> layer 3
-    Dedicated UI controls:
-      left click = add point, Undo = remove last, Save = continue, Skip = ignore side
+        Dedicated UI controls:
+            LMB = add point, MMB = delete nearest point, RMB-hold = preview trendline/apparent velocity,
+            Undo = remove last, Save = continue, Skip = ignore side
     """
     try:
         backend = str(plt.get_backend()).lower()
@@ -1667,7 +1870,7 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
     ax.plot(x_vals, t_vals, "o-", ms=4, lw=1.2, color="#1f77b4")
     ax.set_xlabel("Corrected true offset XO (m)", color=c["label"])
     ax.set_ylabel("Corrected travel-time (ms)", color=c["label"])
-    ax.set_title(title + "\nPick x1..x6 with mouse (LMB). Use buttons on right.",
+    ax.set_title(title + "\nPick x1..x6 (LMB), delete near point (MMB), hold RMB for trend preview.",
                  color=c["text"], fontsize=10)
     ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
     ax.tick_params(colors=c["tick"])
@@ -1675,9 +1878,30 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         sp.set_edgecolor(c["spine"])
 
     pick_names = ["x1", "x2", "x3", "x4", "x5", "x6"]
-    state = {"xs": [], "ts": [], "done": False, "skip": False}
+    state = {
+        "xs": [],
+        "ts": [],
+        "done": False,
+        "skip": False,
+        "preview_active": False,
+        "preview_anchor_idx": None,
+    }
     click_lines: list = []
     click_labels: list = []
+
+    preview_line, = ax.plot([], [], "--", lw=1.2, color="#ff7f0e", alpha=0.9, zorder=6, visible=False)
+    preview_txt = ax.text(
+        0.98,
+        0.02,
+        "",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="right",
+        fontsize=8,
+        color=c["text"],
+        bbox=dict(boxstyle="round,pad=0.30", facecolor=c["ax_bg"], edgecolor=c["spine"], alpha=0.90),
+        visible=False,
+    )
 
     info_ax = fig.add_axes([0.76, 0.62, 0.22, 0.28])
     info_ax.set_facecolor(c["ax_bg"])
@@ -1691,9 +1915,30 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         "x1-x2: layer1\n"
         "x3-x4: layer2\n"
         "x5-x6: layer3\n\n"
-        "Selected: none",
+        "Selected points:\nnone",
         transform=info_ax.transAxes,
         color=c["text"], fontsize=8, va="top", ha="left",
+    )
+
+    legend_ax = fig.add_axes([0.76, 0.12, 0.22, 0.16])
+    legend_ax.set_facecolor(c["ax_bg"])
+    legend_ax.set_xticks([])
+    legend_ax.set_yticks([])
+    for sp in legend_ax.spines.values():
+        sp.set_edgecolor(c["spine"])
+    legend_ax.text(
+        0.05,
+        0.95,
+        "Mouse controls\n"
+        "LMB: add point\n"
+        "MMB: delete nearest\n"
+        "RMB hold: trend preview\n"
+        "RMB release: clear preview",
+        transform=legend_ax.transAxes,
+        color=c["text"],
+        fontsize=8,
+        va="top",
+        ha="left",
     )
 
     ax_undo = fig.add_axes([0.76, 0.50, 0.22, 0.07])
@@ -1710,6 +1955,80 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         for sp in btn.ax.spines.values():
             sp.set_edgecolor(c["spine"])
 
+    def _clear_preview() -> None:
+        state["preview_active"] = False
+        state["preview_anchor_idx"] = None
+        preview_line.set_visible(False)
+        preview_txt.set_visible(False)
+
+    def _nearest_point_idx(xv: float, tv: float) -> int | None:
+        if not state["xs"]:
+            return None
+        xr = max(1e-9, float(np.max(x_vals) - np.min(x_vals)))
+        tr = max(1e-9, float(np.max(t_vals) - np.min(t_vals)))
+        best_idx = None
+        best_d2 = float("inf")
+        for i, (px, pt) in enumerate(zip(state["xs"], state["ts"])):
+            dx = (float(px) - float(xv)) / xr
+            dt = (float(pt) - float(tv)) / tr
+            d2 = dx * dx + dt * dt
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = i
+        if best_idx is None:
+            return None
+        return int(best_idx) if best_d2 <= (0.06 ** 2) else None
+
+    def _redraw_selected_markers() -> None:
+        while click_lines:
+            ln = click_lines.pop()
+            try:
+                ln.remove()
+            except Exception:
+                pass
+        while click_labels:
+            tx = click_labels.pop()
+            try:
+                tx.remove()
+            except Exception:
+                pass
+
+        for idx, (xv, tv) in enumerate(zip(state["xs"], state["ts"])):
+            nm = pick_names[idx] if idx < len(pick_names) else f"x{idx + 1}"
+            ln = ax.axvline(x=float(xv), color="#e63946", lw=1.0, ls="--", alpha=0.85)
+            tx = ax.text(float(xv), float(tv), f"{nm}\n{float(tv):.1f}ms", color="#e63946", fontsize=8,
+                         rotation=90, va="bottom", ha="center")
+            click_lines.append(ln)
+            click_labels.append(tx)
+
+    def _update_preview(xc: float, tc: float) -> None:
+        if not state["preview_active"]:
+            return
+        idx = state.get("preview_anchor_idx", None)
+        if idx is None or idx < 0 or idx >= len(state["xs"]):
+            _clear_preview()
+            return
+        xa = float(state["xs"][idx])
+        ta = float(state["ts"][idx])
+        xb = float(xc)
+        tb = float(tc)
+        preview_line.set_data([xa, xb], [ta, tb])
+        preview_line.set_visible(True)
+        dt_ms = float(tb - ta)
+        dx_m = float(xb - xa)
+        if abs(dt_ms) > 1e-9:
+            v_app = 1000.0 * abs(dx_m) / abs(dt_ms)
+            v_txt = f"{v_app:.1f} m/s"
+        else:
+            v_txt = "inf"
+        preview_txt.set_text(
+            f"Preview\n"
+            f"from x={xa:.2f}, t={ta:.2f}\n"
+            f"to   x={xb:.2f}, t={tb:.2f}\n"
+            f"Vapp ~ {v_txt}"
+        )
+        preview_txt.set_visible(True)
+
     def _update_info():
         if not state["xs"]:
             sel = "none"
@@ -1718,14 +2037,14 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
             for i, xv in enumerate(state["xs"]):
                 nm = pick_names[i] if i < len(pick_names) else f"x{i}"
                 tv = state["ts"][i] if i < len(state["ts"]) else float("nan")
-                parts.append(f"{nm}={xv:.2f}, t={tv:.2f}")
-            sel = ", ".join(parts)
+                parts.append(f"{nm}={xv:.2f}, t{i+1}={tv:.2f}")
+            sel = "\n".join(parts)
         info_txt.set_text(
             "Layer windows\n"
             "x1-x2: layer1\n"
             "x3-x4: layer2\n"
             "x5-x6: layer3\n\n"
-            f"Selected: {sel}"
+            f"Selected points:\n{sel}"
         )
 
     def _finish(skip: bool):
@@ -1744,18 +2063,8 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         state["xs"].pop()
         if state["ts"]:
             state["ts"].pop()
-        if click_lines:
-            ln = click_lines.pop()
-            try:
-                ln.remove()
-            except Exception:
-                pass
-        if click_labels:
-            tx = click_labels.pop()
-            try:
-                tx.remove()
-            except Exception:
-                pass
+        _redraw_selected_markers()
+        _clear_preview()
         _update_info()
         fig.canvas.draw_idle()
 
@@ -1772,21 +2081,56 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
     def _on_click(evt: Any):
         if evt.inaxes is not ax or evt.xdata is None or evt.ydata is None:
             return
+        if evt.button == 2:
+            idx_near = _nearest_point_idx(float(evt.xdata), float(evt.ydata))
+            if idx_near is None:
+                return
+            state["xs"].pop(idx_near)
+            state["ts"].pop(idx_near)
+            _redraw_selected_markers()
+            _clear_preview()
+            _update_info()
+            fig.canvas.draw_idle()
+            return
+        if evt.button == 3:
+            if not state["xs"]:
+                return
+            idx_near = _nearest_point_idx(float(evt.xdata), float(evt.ydata))
+            state["preview_anchor_idx"] = idx_near if idx_near is not None else (len(state["xs"]) - 1)
+            state["preview_active"] = True
+            _update_preview(float(evt.xdata), float(evt.ydata))
+            fig.canvas.draw_idle()
+            return
+        if evt.button != 1:
+            return
         if len(state["xs"]) >= 6:
             return
         xv = float(evt.xdata)
         tv = float(evt.ydata)
-        idx = len(state["xs"])
         state["xs"].append(xv)
         state["ts"].append(tv)
-        nm = pick_names[idx]
-        ln = ax.axvline(x=xv, color="#e63946", lw=1.0, ls="--", alpha=0.85)
-        tx = ax.text(xv, tv, f"{nm}\n{tv:.1f}ms", color="#e63946", fontsize=8,
-                 rotation=90, va="bottom", ha="center")
-        click_lines.append(ln)
-        click_labels.append(tx)
+        _redraw_selected_markers()
+        _clear_preview()
         _update_info()
         fig.canvas.draw_idle()
+
+    def _on_motion(evt: Any):
+        if not state["preview_active"]:
+            return
+        if evt.inaxes is not ax or evt.xdata is None or evt.ydata is None:
+            return
+        _update_preview(float(evt.xdata), float(evt.ydata))
+        fig.canvas.draw_idle()
+
+    def _on_release(evt: Any):
+        if evt.button == 3 and state["preview_active"]:
+            _clear_preview()
+            fig.canvas.draw_idle()
+
+    def _on_leave(_evt: Any):
+        if state["preview_active"]:
+            _clear_preview()
+            fig.canvas.draw_idle()
 
     def _on_key(evt: Any):
         if evt.key == "enter":
@@ -1800,6 +2144,9 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         _finish(True)
 
     fig.canvas.mpl_connect("button_press_event", _on_click)
+    fig.canvas.mpl_connect("motion_notify_event", _on_motion)
+    fig.canvas.mpl_connect("button_release_event", _on_release)
+    fig.canvas.mpl_connect("axes_leave_event", _on_leave)
     fig.canvas.mpl_connect("key_press_event", _on_key)
     fig.canvas.mpl_connect("close_event", _on_close)
     _update_info()
@@ -2047,10 +2394,10 @@ def _review_layer_fit_interactive(x_vals: Any, t_vals: Any,
 
     if vel_lines:
         ax_tx.text(
-            0.02, 0.02,
+            0.98, 0.02,
             "Apparent velocity\n" + "\n".join(vel_lines),
             transform=ax_tx.transAxes,
-            va="bottom", ha="left",
+            va="bottom", ha="right",
             fontsize=8,
             color=c["text"],
             bbox=dict(boxstyle="round,pad=0.35",
@@ -2740,56 +3087,75 @@ def export_corrected_qc_plot(profile_name: str,
 
 class FirstBreakPicker:
     """
-    Matplotlib interactive first-break picker for one shot record.
+    Interactive first-break picker for one shot record.
 
-    Key design decisions
-    --------------------
-    - run() uses plt.show(block=False) + a manual polling loop.
-      This avoids the double-open artefact caused by plt.show(block=True)
-      on Windows (figure re-appearing after plt.close was called by a key handler).
-        - Prev/Next store picks in session and keep the picking loop active.
-        - Save/Close ('s') finalizes the profile and exits to export stage.
-    - The JSON always stores RAW picks; BULK_SHIFT_MS is applied later.
+    Controls
+    --------
+    Left click / drag: place picks
+    Right click / drag: delete picks
+    Shift + Left click: range-fill picks
+    a: auto-pick using selected mode
+    f: cycle filter mode (none/butter/ormsby)
+    g: cycle gain (none -> norm -> agc)
+    o: cycle auto-pick mode (stalta/maxdiff_zero/hilbert_env)
+    v: toggle display polarity
+    l: toggle timeline guides
+    c: top axis channel/offset
+    p: save and go previous shot
+    n: save and go next shot
+    s: save and finalize profile
+    q / Esc: quit
     """
 
-    def __init__(self, data_raw: Any, data_filt: Any, dt_s: float,
-                 recv_abs: Any, shot_id: int, profile_name: str,
-                 shot_pos_m: float = 0.0,
-                 delay_ms: float = 0.0,
-                 existing_picks: dict | None = None,
-                 qc_dir: Path | None = None,
-                 save_callback: Any = None,
-                 header_info: dict | None = None):
-        self.data_raw   = data_raw
-        self.data_filt  = data_filt
-        self.dt_s       = dt_s
-        self.recv_abs   = recv_abs      # absolute receiver positions (m)
+    def __init__(
+        self,
+        data_raw: Any,
+        data_filt: Any,
+        dt_s: float,
+        recv_abs: Any,
+        shot_id: int,
+        profile_name: str,
+        shot_pos_m: float = 0.0,
+        delay_ms: float = 0.0,
+        existing_picks: dict | None = None,
+        qc_dir: Path | None = None,
+        save_callback: Any = None,
+        header_info: dict | None = None,
+    ):
+        self.data_raw = data_raw
+        self.data_filt = data_filt
+        self.dt_s = dt_s
+        self.recv_abs = recv_abs
         self.shot_pos_m = shot_pos_m
-        self.delay_ms   = delay_ms      # time of first sample relative to trigger (ms)
-        self.shot_id    = shot_id
-        self.profile    = profile_name
-        self.qc_dir     = qc_dir or (OUTPUT_DIR / profile_name)
+        self.delay_ms = delay_ms
+        self.shot_id = shot_id
+        self.profile = profile_name
+        self.qc_dir = qc_dir or (OUTPUT_DIR / profile_name)
 
         self._picks: dict = {}
-        self._saved          = False
-        self._cancelled      = False
-        self._done           = False
-        self._filter_mode    = "ormsby" if FILTER_ON else "none"  # none|ormsby|butter
-        self._inverted       = True
-        self._top_mode       = "channel"   # "channel" or "offset" (toggle with 'c')
-        self.ax_top: Any     = None
-        self._save_callback  = save_callback   # called on nav/finalize with picks dict
-        self._header_info    = header_info or {}
-        self._nav_action     = "stay"   # "next" | "prev" | "finalize" | "quit" | "stay"
-        self._drag_pick      = False
-        self._drag_delete    = False
+        self._saved = False
+        self._cancelled = False
+        self._done = False
+        if FILTER_ON:
+            mode = str(DEFAULT_FILTER_MODE).strip().lower()
+            self._filter_mode = mode if mode in {"none", "butter", "ormsby", "cutpass"} else "butter"
+        else:
+            self._filter_mode = "none"
+        self._inverted = True
+        self._top_mode = "channel"
+        self.ax_top: Any = None
+        self._save_callback = save_callback
+        self._header_info = header_info or {}
+        self._nav_action = "stay"
+        self._drag_pick = False
+        self._drag_delete = False
         self._last_drag_idx: Any = None
         self._last_drag_t: float | None = None
         self._range_anchor: Any = None
-        self._gain_mode      = GAIN_MODE
-        self._agc_window_ms  = AGC_WINDOW_MS
-        self._agc_stat       = AGC_STAT
-        self._display_mode   = DISPLAY_MODE
+        self._gain_mode = GAIN_MODE
+        self._agc_window_ms = AGC_WINDOW_MS
+        self._agc_stat = AGC_STAT
+        self._display_mode = DISPLAY_MODE
         self._show_timelines = SHOW_TIMELINES
         self._wiggle_stretch = WIGGLE_STRETCH
         self._f1 = BP_F1
@@ -2799,11 +3165,24 @@ class FirstBreakPicker:
         self._butter_order = BUTTER_ORDER
         self._filter_debounce_ms = max(0, int(FILTER_DEBOUNCE_MS))
         self._filter_timer: Any = None
+        self._auto_pick_mode = str(AUTO_PICK_MODE).strip().lower()
+        self._pick_order = str(PICK_PROCESS_ORDER).strip().upper()
+        self._hilbert_target = str(HILBERT_TARGET).strip().lower()
+        self._hover_help_map: dict[Any, str] = {}
 
         self.data_ormsby = self.data_filt
         self.data_butter = apply_butterworth_all_params(
-            self.data_raw, self.dt_s,
-            low_hz=self._f2, high_hz=self._f3,
+            self.data_raw,
+            self.dt_s,
+            low_hz=self._f2,
+            high_hz=self._f3,
+            order=self._butter_order,
+        )
+        self.data_cutpass = apply_cutpass_all_params(
+            self.data_raw,
+            self.dt_s,
+            low_cut_hz=self._f1,
+            high_cut_hz=self._f4,
             order=self._butter_order,
         )
 
@@ -2811,32 +3190,22 @@ class FirstBreakPicker:
             self._picks = {int(k): float(v) for k, v in existing_picks.items()}
 
         self.n_traces = data_raw.shape[0]
-        self.n_samp   = data_raw.shape[1]
-        dt_ms         = dt_s * 1000.0
-
-        # Absolute time axis:  first sample at delay_ms, increases by dt_ms
+        self.n_samp = data_raw.shape[1]
+        dt_ms = dt_s * 1000.0
         self.times_ms = delay_ms + np.arange(self.n_samp) * dt_ms
 
-        # Display window: T_DISPLAY_PRE_MS (< 0) to T_MAX_MS
         self.t_disp_start = max(delay_ms, T_DISPLAY_PRE_MS)
-        self.t_disp_end   = T_MAX_MS
+        self.t_disp_end = T_MAX_MS
         self._t_view_start = float(self.t_disp_start)
         self._t_view_end = float(self.t_disp_end)
         self._t_full_start = float(delay_ms)
         self._t_full_end = float(delay_ms + (self.n_samp - 1) * dt_ms)
         self._t_view_end = min(self._t_view_end, self._t_full_end)
-        t_start_idx = max(0, int((self.t_disp_start - delay_ms) / dt_ms))
-        t_end_idx   = min(int((self.t_disp_end   - delay_ms) / dt_ms) + 2,
-                          self.n_samp)
-        self.t_slice = slice(t_start_idx, t_end_idx)
 
-        # Trace spacing for wiggle display
         off_range = float(np.ptp(recv_abs)) if len(recv_abs) > 1 else 1.0
-        self._dx  = off_range / max(len(recv_abs) - 1, 1)
+        self._dx = off_range / max(len(recv_abs) - 1, 1)
 
         self._build_figure()
-
-    # ---- figure ------------------------------------------------------------
 
     def _build_figure(self):
         c = _tc()
@@ -2846,20 +3215,24 @@ class FirstBreakPicker:
         self.ax.set_facecolor(c["ax_bg"])
         try:
             self.fig.canvas.manager.set_window_title(
-                f"LVL Picker  --  {self.profile}  Shot {self.shot_id}")
+                f"LVL Picker -- {self.profile} Shot {self.shot_id}"
+            )
         except Exception:
             pass
+
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover_help)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
-        self.fig.canvas.mpl_connect("key_press_event",    self._on_key)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
         self._build_controls()
-        self._redraw()   # creates ax_top secondary axis inside
+        self._redraw()
 
     def _build_controls(self):
         c = _tc()
         x0 = 0.78
-        w  = 0.20
+        w = 0.20
         row_h = 0.032
         gap = 0.005
         row3_w = (w - 2 * gap) / 3.0
@@ -2869,8 +3242,9 @@ class FirstBreakPicker:
         self.ax_btn_save = self.fig.add_axes([x0 + 2 * (row3_w + gap), 0.88, row3_w, row_h])
 
         self.ax_btn_auto = self.fig.add_axes([x0 + 0 * (row3_w + gap), 0.84, row3_w, row_h])
-        self.ax_btn_inv  = self.fig.add_axes([x0 + 1 * (row3_w + gap), 0.84, row3_w, row_h])
-        self.ax_btn_tl   = self.fig.add_axes([x0 + 2 * (row3_w + gap), 0.84, row3_w, row_h])
+        self.ax_btn_inv = self.fig.add_axes([x0 + 1 * (row3_w + gap), 0.84, row3_w, row_h])
+        self.ax_btn_tl = self.fig.add_axes([x0 + 2 * (row3_w + gap), 0.84, row3_w, row_h])
+        self.ax_btn_apply = self.fig.add_axes([x0 + 0.125, 0.408, 0.03, 0.024])
 
         btn_face = c["ax_bg"]
         btn_hover = "#e8e8e8" if THEME == "light" else "#2a2d3d"
@@ -2879,10 +3253,18 @@ class FirstBreakPicker:
         self.btn_next = Button(self.ax_btn_next, "Next", color=btn_face, hovercolor=btn_hover)
         self.btn_save = Button(self.ax_btn_save, "Save/Close", color=btn_face, hovercolor=btn_hover)
         self.btn_auto = Button(self.ax_btn_auto, "Auto Picker", color=btn_face, hovercolor=btn_hover)
-        self.btn_inv  = Button(self.ax_btn_inv, "", color=btn_face, hovercolor=btn_hover)
-        self.btn_tl   = Button(self.ax_btn_tl, "Timeline", color=btn_face, hovercolor=btn_hover)
-        for btn in (self.btn_prev, self.btn_save, self.btn_next,
-                    self.btn_auto, self.btn_inv, self.btn_tl):
+        self.btn_inv = Button(self.ax_btn_inv, "", color=btn_face, hovercolor=btn_hover)
+        self.btn_tl = Button(self.ax_btn_tl, "Timeline", color=btn_face, hovercolor=btn_hover)
+        self.btn_apply = Button(self.ax_btn_apply, "Apply", color=btn_face, hovercolor=btn_hover)
+        for btn in (
+            self.btn_prev,
+            self.btn_save,
+            self.btn_next,
+            self.btn_auto,
+            self.btn_inv,
+            self.btn_tl,
+            self.btn_apply,
+        ):
             btn.label.set_color(c["text"])
             btn.label.set_fontsize(8)
             for sp in btn.ax.spines.values():
@@ -2897,72 +3279,115 @@ class FirstBreakPicker:
         self.btn_auto.on_clicked(lambda _e: self._auto_then_redraw())
         self.btn_inv.on_clicked(lambda _e: self._toggle_invert())
         self.btn_tl.on_clicked(lambda _e: self._toggle_timelines())
+        self.btn_apply.on_clicked(lambda _e: self._apply_current_settings_to_picks())
+
+        self._register_hover(self.ax_btn_prev, "Previous shot")
+        self._register_hover(self.ax_btn_next, "Next shot")
+        self._register_hover(self.ax_btn_save, "Finalize and save picks")
+        self._register_hover(self.ax_btn_auto, "Run auto picker on all traces")
+        self._register_hover(self.ax_btn_inv, "Toggle display polarity")
+        self._register_hover(self.ax_btn_tl, "Toggle timeline guides")
+        self._register_hover(self.ax_btn_apply, "Re-apply current mode/settings to existing picks")
 
         label_fs = 8
-        value_fs = 8
-        self.fig.text(x0, 0.80, "Gain Control:", fontsize=label_fs, fontweight="bold",
-                  color=c["text"], ha="left", va="bottom")
-        self.fig.text(x0, 0.76, "AGC stat:", fontsize=label_fs, fontweight="bold",
-                  color=c["text"], ha="left", va="bottom")
-        self.fig.text(x0, 0.72, "Display:", fontsize=label_fs, fontweight="bold",
-              color=c["text"], ha="left", va="bottom")
-        self.fig.text(x0, 0.620, "Filter mode:", fontsize=label_fs, fontweight="bold",
-              color=c["text"], ha="left", va="bottom")
-        self.fig.text(x0, 0.580, "Butter order:", fontsize=label_fs, fontweight="bold",
-              color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.80, "Gain Control:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.76, "AGC stat:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.72, "Display:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.620, "Filter mode:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.580, "Butter order:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.495, "Pick mode:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.455, "Reihenfolge:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.415, "Hilbert:", fontsize=label_fs, fontweight="bold", color=c["text"], ha="left", va="bottom")
 
         self._gain_labels = ("none", "norm", "agc")
         self._gain_btns = self._make_mode_buttons(
             x0=x0 + 0.055, y=0.792, w=0.145, h=0.026,
             labels=self._gain_labels, callback=self._on_gain_mode,
+            tooltips=("No gain", "Per-trace normalize", "Automatic gain control"),
         )
 
         self._stat_labels = ("rms", "mean")
         self._stat_btns = self._make_mode_buttons(
             x0=x0 + 0.055, y=0.752, w=0.095, h=0.026,
             labels=self._stat_labels, callback=self._on_agc_stat,
+            tooltips=("RMS AGC envelope", "Mean-abs AGC envelope"),
         )
 
         self._disp_labels = ("wiggle", "vd", "both")
         self._disp_btns = self._make_mode_buttons(
             x0=x0 + 0.055, y=0.712, w=0.145, h=0.026,
             labels=self._disp_labels, callback=self._on_display_mode,
+            tooltips=("Wiggle only", "Variable-density only", "Wiggle + variable-density"),
         )
 
-        self._filt_labels = ("none", "butter", "ormsby")
+        self._filt_labels = ("none", "butter", "ormsby", "cutpass")
         self._filt_btns = self._make_mode_buttons(
             x0=x0 + 0.055, y=0.620, w=0.145, h=0.026,
             labels=self._filt_labels, callback=self._on_filter_mode,
+            tooltips=("No filter", "Butterworth bandpass", "Ormsby bandpass", "Low-cut f1 + high-cut f4"),
         )
 
         self._butter_order_labels = ("2", "4", "6")
         self._butter_order_btns = self._make_mode_buttons(
-            x0=x0 + 0.055, y=0.580, w=0.095, h=0.026,
+            x0=x0 + 0.055, y=0.580, w=0.05, h=0.026,
             labels=self._butter_order_labels, callback=self._on_butter_order,
+            tooltips=("Butterworth order 2", "Butterworth order 4", "Butterworth order 6"),
         )
 
-        self.ax_agc = self.fig.add_axes([x0+0.02, 0.67, 0.25*w, 0.016], facecolor=c["ax_bg"])
-        self.sl_agc = Slider(self.ax_agc, "AGC ", 5.0, 500.0,
-                             valinit=float(self._agc_window_ms), valstep=1.0)
+        self._pick_mode_labels = ("stalta", "maxdiff_zero", "hilbert_env")
+        self._pick_mode_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.488, w=0.145, h=0.026,
+            labels=self._pick_mode_labels, callback=self._on_auto_pick_mode,
+            tooltips=("Classic STA/LTA", "Peak then zero-cross onset", "Hilbert envelope onset/peak"),
+        )
+
+        self._pick_order_labels = ("F>G>X", "G>F>X", "RAW>X")
+        self._pick_order_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.448, w=0.145, h=0.026,
+            labels=self._pick_order_labels, callback=self._on_pick_order,
+            tooltips=("Filter, then gain, then pick", "Gain, then filter, then pick", "Pick on raw trace"),
+        )
+
+        self._hilbert_target_labels = ("onset", "peak")
+        self._hilbert_target_btns = self._make_mode_buttons(
+            x0=x0 + 0.055, y=0.408, w=0.065, h=0.026,
+            labels=self._hilbert_target_labels, callback=self._on_hilbert_target,
+            tooltips=("Use first threshold crossing", "Use envelope peak"),
+        )
+
+        self.ax_agc = self.fig.add_axes([x0 + 0.02, 0.67, 0.25 * w, 0.016], facecolor=c["ax_bg"])
+        self.sl_agc = Slider(
+            self.ax_agc,
+            "AGC",
+            5.0,
+            500.0,
+            valinit=float(self._agc_window_ms),
+            valstep=1.0,
+        )
         self.sl_agc.label.set_fontweight("bold")
         self.sl_agc.label.set_fontsize(8)
         self.sl_agc.valtext.set_fontsize(8)
         self.sl_agc.on_changed(self._on_agc_window)
 
-        self.ax_wig = self.fig.add_axes([x0+0.125, 0.67, 0.25*w, 0.016], facecolor=c["ax_bg"])
-        self.sl_wig = Slider(self.ax_wig, "Scale ", 0.20, 5.00,
-                     valinit=float(self._wiggle_stretch), valstep=0.01)
+        self.ax_wig = self.fig.add_axes([x0 + 0.125, 0.67, 0.25 * w, 0.016], facecolor=c["ax_bg"])
+        self.sl_wig = Slider(
+            self.ax_wig,
+            "Scale",
+            0.20,
+            5.00,
+            valinit=float(self._wiggle_stretch),
+            valstep=0.01,
+        )
         self.sl_wig.label.set_fontweight("bold")
         self.sl_wig.label.set_fontsize(8)
         self.sl_wig.valtext.set_fontsize(8)
         self.sl_wig.on_changed(self._on_wiggle_stretch)
 
-        self.fig.text(x0, 0.485, "Time View (ms)", fontsize=8, fontweight="bold",
-                  color=c["text"], ha="left", va="bottom")
+        self.fig.text(x0, 0.365, "Time View (ms)", fontsize=8, fontweight="bold", color=c["text"], ha="left", va="bottom")
         tmin_hi = max(self._t_full_start + 1.0, self._t_full_end - 1.0)
         tmax_lo = min(self._t_full_end - 1.0, self._t_full_start + 1.0)
-        self.ax_tmin = self.fig.add_axes([x0 + 0.02, 0.455, 0.25*w, 0.014], facecolor=c["ax_bg"])
-        self.ax_tmax = self.fig.add_axes([x0 + 0.125, 0.455, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmin = self.fig.add_axes([x0 + 0.02, 0.335, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_tmax = self.fig.add_axes([x0 + 0.125, 0.335, 0.25 * w, 0.014], facecolor=c["ax_bg"])
         self.sl_tmin = Slider(self.ax_tmin, "T min", self._t_full_start, tmin_hi,
                       valinit=float(self._t_view_start), valstep=1.0)
         self.sl_tmax = Slider(self.ax_tmax, "T max", tmax_lo, self._t_full_end,
@@ -2976,13 +3401,13 @@ class FirstBreakPicker:
         self.sl_tmin.on_changed(self._on_tmin)
         self.sl_tmax.on_changed(self._on_tmax)
 
-        self.ax_f1 = self.fig.add_axes([x0+0.0125, 0.550, 0.25*w, 0.014], facecolor=c["ax_bg"])
-        self.ax_f2 = self.fig.add_axes([x0+0.125, 0.550, 0.25*w, 0.014], facecolor=c["ax_bg"])
-        self.ax_f3 = self.fig.add_axes([x0+0.0125, 0.525, 0.25*w, 0.014], facecolor=c["ax_bg"])
-        self.ax_f4 = self.fig.add_axes([x0+0.125, 0.525, 0.25*w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f1 = self.fig.add_axes([x0 + 0.0125, 0.550, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f2 = self.fig.add_axes([x0 + 0.125, 0.550, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f3 = self.fig.add_axes([x0 + 0.0125, 0.525, 0.25 * w, 0.014], facecolor=c["ax_bg"])
+        self.ax_f4 = self.fig.add_axes([x0 + 0.125, 0.525, 0.25 * w, 0.014], facecolor=c["ax_bg"])
 
-        self.sl_f1 = Slider(self.ax_f1, "f1 ", 0.0, 50.0, valinit=float(self._f1), valstep=0.5)
-        self.sl_f2 = Slider(self.ax_f2, "f2 ", 0.5, 80.0, valinit=float(self._f2), valstep=0.5)
+        self.sl_f1 = Slider(self.ax_f1, "f1 ", 0.0, 50.0, valinit=float(self._f1), valstep=1)
+        self.sl_f2 = Slider(self.ax_f2, "f2 ", 0.5, 80.0, valinit=float(self._f2), valstep=1)
         self.sl_f3 = Slider(self.ax_f3, "f3 ", 20.0, 220.0, valinit=float(self._f3), valstep=1.0)
         self.sl_f4 = Slider(self.ax_f4, "f4 ", 40.0, 260.0, valinit=float(self._f4), valstep=1.0)
         self.sl_f1.on_changed(self._on_filter_sliders)
@@ -2990,41 +3415,76 @@ class FirstBreakPicker:
         self.sl_f3.on_changed(self._on_filter_sliders)
         self.sl_f4.on_changed(self._on_filter_sliders)
 
-        # Header/parameter info panel
-        self.ax_info = self.fig.add_axes([x0, 0.125, w, 0.23], facecolor=c["ax_bg"])
+        self.ax_info = self.fig.add_axes([x0, 0.025, w, 0.30], facecolor=c["ax_bg"])
         self.ax_info.set_xticks([])
         self.ax_info.set_yticks([])
         for sp in self.ax_info.spines.values():
             sp.set_edgecolor(c["spine"])
-        self.info_text = self.ax_info.text(0.02, 0.98, "", va="top", ha="left",
-                                           fontsize=8, color=c["text"],
-                                           transform=self.ax_info.transAxes)
+        self.info_text = self.ax_info.text(
+            0.02,
+            0.98,
+            "",
+            va="top",
+            ha="left",
+            fontsize=8,
+            color=c["text"],
+            transform=self.ax_info.transAxes,
+        )
+        self.hover_text = self.fig.text(
+            x0,
+            0.925,
+            "Hover help: move cursor over a button",
+            va="center",
+            ha="left",
+            fontsize=8,
+            color=c["label"],
+        )
+
         self._refresh_mode_buttons()
 
     def _make_mode_buttons(self, x0: float, y: float, w: float, h: float,
-                           labels: tuple, callback: Any) -> list:
+                           labels: tuple, callback: Any,
+                           tooltips: tuple | None = None) -> list:
         c = _tc()
-        value_fs = 8
         gap = 0.004
         n = max(1, len(labels))
         bw = (w - gap * (n - 1)) / n
         buttons: list = []
         for i, lbl in enumerate(labels):
             axb = self.fig.add_axes([x0 + i * (bw + gap), y, bw, h])
-            btn = Button(axb, str(lbl), color=c["ax_bg"],
-                         hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d")
+            btn = Button(
+                axb,
+                str(lbl),
+                color=c["ax_bg"],
+                hovercolor="#e8e8e8" if THEME == "light" else "#2a2d3d",
+            )
             btn.label.set_color(c["text"])
-            btn.label.set_fontsize(value_fs)
+            btn.label.set_fontsize(8)
             for sp in btn.ax.spines.values():
                 sp.set_edgecolor(c["spine"])
             btn.on_clicked(lambda _e, _lbl=str(lbl): callback(_lbl))
             buttons.append(btn)
+            if tooltips is not None and i < len(tooltips):
+                self._register_hover(axb, str(tooltips[i]))
         return buttons
+
+    def _register_hover(self, ax: Any, text: str):
+        self._hover_help_map[ax] = str(text)
+
+    def _on_hover_help(self, event: Any):
+        msg = ""
+        if event is not None and event.inaxes is not None:
+            msg = self._hover_help_map.get(event.inaxes, "")
+        if not msg:
+            msg = "Hover help: move cursor over a button"
+        if hasattr(self, "hover_text"):
+            self.hover_text.set_text(msg)
+            self.fig.canvas.draw_idle()
 
     def _style_mode_buttons(self, buttons: list, labels: tuple, active_label: str):
         c = _tc()
         for btn, lbl in zip(buttons, labels):
-            is_active = (str(lbl).lower() == str(active_label).lower())
+            is_active = str(lbl).lower() == str(active_label).lower()
             active_face = "#d9e8ff" if THEME == "light" else "#2a3b5c"
             inactive_face = c["ax_bg"]
             btn.ax.set_facecolor(active_face if is_active else inactive_face)
@@ -3042,11 +3502,13 @@ class FirstBreakPicker:
         if hasattr(self, "_filt_btns"):
             self._style_mode_buttons(self._filt_btns, self._filt_labels, self._filter_mode)
         if hasattr(self, "_butter_order_btns"):
-            self._style_mode_buttons(
-                self._butter_order_btns,
-                self._butter_order_labels,
-                str(int(self._butter_order)),
-            )
+            self._style_mode_buttons(self._butter_order_btns, self._butter_order_labels, str(int(self._butter_order)))
+        if hasattr(self, "_pick_mode_btns"):
+            self._style_mode_buttons(self._pick_mode_btns, self._pick_mode_labels, self._auto_pick_mode)
+        if hasattr(self, "_pick_order_btns"):
+            self._style_mode_buttons(self._pick_order_btns, self._pick_order_labels, self._pick_order)
+        if hasattr(self, "_hilbert_target_btns"):
+            self._style_mode_buttons(self._hilbert_target_btns, self._hilbert_target_labels, self._hilbert_target)
 
     def _refresh_toggle_buttons(self):
         c = _tc()
@@ -3070,6 +3532,11 @@ class FirstBreakPicker:
             self.btn_inv.label.set_text("Normal Pol" if self._inverted else "Inverse Pol")
             self._refresh_toggle_buttons()
 
+    def _on_gain_mode(self, label: str):
+        self._gain_mode = str(label)
+        self._refresh_mode_buttons()
+        self._redraw()
+
     def _on_tmin(self, val: float):
         v = float(val)
         if v >= self._t_view_end - 1.0:
@@ -3086,11 +3553,6 @@ class FirstBreakPicker:
             self.sl_tmax.set_val(v)
             return
         self._t_view_end = v
-        self._redraw()
-
-    def _on_gain_mode(self, label: str):
-        self._gain_mode = str(label)
-        self._refresh_mode_buttons()
         self._redraw()
 
     def _on_agc_stat(self, label: str):
@@ -3112,6 +3574,21 @@ class FirstBreakPicker:
         self._refresh_mode_buttons()
         self._redraw()
 
+    def _on_auto_pick_mode(self, label: str):
+        self._auto_pick_mode = str(label).strip().lower()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _on_pick_order(self, label: str):
+        self._pick_order = str(label).strip().upper()
+        self._refresh_mode_buttons()
+        self._redraw()
+
+    def _on_hilbert_target(self, label: str):
+        self._hilbert_target = str(label).strip().lower()
+        self._refresh_mode_buttons()
+        self._redraw()
+
     def _on_filter_mode(self, label: str):
         self._filter_mode = str(label).lower()
         self._refresh_mode_buttons()
@@ -3128,12 +3605,21 @@ class FirstBreakPicker:
         self._schedule_filter_update()
         self._refresh_mode_buttons()
 
+    def _toggle_invert(self):
+        self._inverted = not self._inverted
+        self._update_invert_button_label()
+        self._redraw()
+
+    def _toggle_timelines(self):
+        self._show_timelines = not self._show_timelines
+        self._refresh_toggle_buttons()
+        self._redraw()
+
     def _schedule_filter_update(self):
         if self._filter_debounce_ms <= 0:
             self._apply_filter_update_now()
             return
 
-        # Recreate timer each time to debounce rapid slider events.
         try:
             if self._filter_timer is not None:
                 self._filter_timer.stop()
@@ -3149,14 +3635,23 @@ class FirstBreakPicker:
         self._recompute_filter()
         self._redraw()
 
-    def _toggle_invert(self):
-        self._inverted = not self._inverted
-        self._update_invert_button_label()
-        self._redraw()
-
-    def _toggle_timelines(self):
-        self._show_timelines = not self._show_timelines
-        self._refresh_toggle_buttons()
+    def _apply_current_settings_to_picks(self):
+        """Re-snap all current picks using active pick mode/order and settings."""
+        if not self._picks:
+            print("     Apply: no picks to update.")
+            return
+        updated = 0
+        new_map: dict[int, float] = {}
+        for idx, t_old in self._picks.items():
+            t_new = round(float(self._snap_pick_time_ms(int(idx), float(t_old))), 2)
+            if self._t_view_start <= t_new <= self._t_view_end:
+                new_map[int(idx)] = t_new
+            else:
+                new_map[int(idx)] = float(t_old)
+            if abs(float(new_map[int(idx)]) - float(t_old)) > 1e-6:
+                updated += 1
+        self._picks = new_map
+        print(f"     Apply: updated {updated}/{len(self._picks)} picks using mode={self._auto_pick_mode}, order={self._pick_order}.")
         self._redraw()
 
     def _on_filter_sliders(self, _val: float):
@@ -3165,39 +3660,165 @@ class FirstBreakPicker:
         f3 = float(self.sl_f3.val)
         f4 = float(self.sl_f4.val)
         if not (f1 < f2 < f3 < f4):
-            # Ignore transient invalid states while dragging neighboring sliders.
             return
         self._f1, self._f2, self._f3, self._f4 = f1, f2, f3, f4
         self._schedule_filter_update()
-
-    # ---- data --------------------------------------------------------------
 
     def _active_data(self) -> Any:
         if self._filter_mode == "ormsby":
             d = self.data_ormsby
         elif self._filter_mode == "butter":
             d = self.data_butter
+        elif self._filter_mode == "cutpass":
+            d = self.data_cutpass
         else:
             d = self.data_raw
-        d = apply_gain(d, self.dt_s, mode=self._gain_mode,
-                       window_ms=self._agc_window_ms, stat=self._agc_stat)
+        d = apply_gain(
+            d,
+            self.dt_s,
+            mode=self._gain_mode,
+            window_ms=self._agc_window_ms,
+            stat=self._agc_stat,
+        )
         return -d if self._inverted else d
 
     def _recompute_filter(self):
         self.data_ormsby = apply_ormsby_all_params(
-            self.data_raw, self.dt_s, self._f1, self._f2, self._f3, self._f4
+            self.data_raw,
+            self.dt_s,
+            self._f1,
+            self._f2,
+            self._f3,
+            self._f4,
         )
         self.data_butter = apply_butterworth_all_params(
-            self.data_raw, self.dt_s,
-            low_hz=self._f2, high_hz=self._f3,
+            self.data_raw,
+            self.dt_s,
+            low_hz=self._f2,
+            high_hz=self._f3,
+            order=self._butter_order,
+        )
+        self.data_cutpass = apply_cutpass_all_params(
+            self.data_raw,
+            self.dt_s,
+            low_cut_hz=self._f1,
+            high_cut_hz=self._f4,
             order=self._butter_order,
         )
 
-    # ---- drawing -----------------------------------------------------------
+    def _apply_gain_single(self, trace: Any) -> Any:
+        arr = np.asarray(trace, dtype=np.float32)[None, :]
+        return apply_gain(
+            arr,
+            self.dt_s,
+            mode=self._gain_mode,
+            window_ms=self._agc_window_ms,
+            stat=self._agc_stat,
+        )[0]
+
+    def _apply_filter_single(self, trace: Any) -> Any:
+        x = np.asarray(trace, dtype=np.float32)
+        if self._filter_mode == "ormsby":
+            return ormsby(x, self.dt_s, f1=self._f1, f2=self._f2, f3=self._f3, f4=self._f4)
+        if self._filter_mode == "butter":
+            return butterworth_bandpass(x, self.dt_s, low_hz=self._f2, high_hz=self._f3, order=self._butter_order)
+        if self._filter_mode == "cutpass":
+            y = butterworth_highpass(x, self.dt_s, low_hz=self._f1, order=self._butter_order)
+            y = butterworth_lowpass(y, self.dt_s, high_hz=self._f4, order=self._butter_order)
+            return y
+        return x
+
+    def _prepare_trace_for_pick(self, trace: Any) -> Any:
+        x = np.asarray(trace, dtype=np.float32)
+        if self._pick_order == "G>F>X":
+            x = self._apply_gain_single(x)
+            x = self._apply_filter_single(x)
+        elif self._pick_order == "RAW>X":
+            x = x
+        else:
+            x = self._apply_filter_single(x)
+            x = self._apply_gain_single(x)
+        if self._inverted:
+            x = -x
+        return np.asarray(x, dtype=np.float32)
+
+    def _timing_correction_ms(self, idx: int) -> float:
+        """Return additional pick-time correction (ms): offset-dependent only."""
+        off = abs(float(self.recv_abs[int(idx)]) - float(self.shot_pos_m)) if 0 <= int(idx) < len(self.recv_abs) else 0.0
+        return float(TRIGGER_MS_PER_M) * off
+
+    def _auto_abs_gate_ms_for_trace(self, idx: int) -> tuple[float, float]:
+        """Return absolute-time gate [ms] for likely first arrivals on one trace."""
+        t_abs_min = max(0.0, float(self._t_view_start))
+        t_abs_max = min(float(self._t_view_end), float(self._t_full_end))
+        if (not AUTO_USE_VELOCITY_GATE) or t_abs_max <= t_abs_min:
+            return t_abs_min, t_abs_max
+
+        off = abs(float(self.recv_abs[int(idx)]) - float(self.shot_pos_m)) if 0 <= int(idx) < len(self.recv_abs) else 0.0
+        vmin = max(1.0, float(AUTO_VMIN_M_S))
+        vmax = max(vmin + 1.0, float(AUTO_VMAX_M_S))
+        pad = max(0.0, float(AUTO_GATE_PAD_MS))
+
+        gate_lo = max(0.0, (off / vmax) * 1000.0 - pad)
+        gate_hi = (off / vmin) * 1000.0 + pad
+
+        lo = max(t_abs_min, gate_lo)
+        hi = min(t_abs_max, gate_hi)
+        if hi <= lo:
+            return t_abs_min, t_abs_max
+        return lo, hi
+
+    def _snap_pick_time_ms(self, idx: int, t_hint_ms: float) -> float:
+        mode = str(self._auto_pick_mode).strip().lower()
+        if mode == "stalta":
+            return float(t_hint_ms) + self._timing_correction_ms(idx)
+
+        tr = self._prepare_trace_for_pick(self.data_raw[idx])
+        t_rel_hint_s = (float(t_hint_ms) - float(self.delay_ms)) / 1000.0
+        # For manual correction, prefer onset BEFORE the click to avoid snapping to wavelet tail.
+        back_s = max(self.dt_s, 1.25 * float(MANUAL_SNAP_WIN_MS) / 1000.0)
+        fwd_s = max(self.dt_s, 0.25 * float(MANUAL_SNAP_WIN_MS) / 1000.0)
+        t0 = max(0.0, t_rel_hint_s - back_s)
+        t1 = min((self.n_samp - 1) * self.dt_s, t_rel_hint_s + fwd_s)
+        if t1 <= t0:
+            return float(t_hint_ms) + self._timing_correction_ms(idx)
+
+        if mode == "maxdiff_zero":
+            ts = _zero_crossing_from_extremum_samples(
+                samples=tr,
+                dt_s=self.dt_s,
+                win_start_s=t0,
+                win_end_s=t1,
+                search_direction=ZERO_X_SEARCH_DIRECTION,
+                use_abs_peak=True,
+            )
+            if ts is None:
+                return float(t_hint_ms) + self._timing_correction_ms(idx)
+            return float(self.delay_ms + 1000.0 * ts + self._timing_correction_ms(idx))
+
+        if mode == "hilbert_env":
+            tr_obj = Trace(data=np.asarray(tr, dtype=np.float32))
+            tr_obj.stats.delta = float(self.dt_s)
+            _env, t_peak, t_onset = hilbert_envelope_pick(
+                trace=tr_obj,
+                win_start_s=t0,
+                win_end_s=t1,
+                onset_pct=HILBERT_ONSET_PCT,
+            )
+            if self._hilbert_target == "peak":
+                ts = t_peak if t_peak is not None else t_onset
+            else:
+                ts = t_onset if t_onset is not None else t_peak
+            if ts is None:
+                return float(t_hint_ms) + self._timing_correction_ms(idx)
+            return float(self.delay_ms + 1000.0 * float(ts) + self._timing_correction_ms(idx))
+
+        return float(t_hint_ms) + self._timing_correction_ms(idx)
 
     def _draw_traces(self):
-        c    = _tc()
+        c = _tc()
         data = self._active_data()
+
         dt_ms = self.dt_s * 1000.0
         i0 = max(0, int((self._t_view_start - self.delay_ms) / dt_ms))
         i1 = min(self.n_samp, int((self._t_view_end - self.delay_ms) / dt_ms) + 2)
@@ -3205,7 +3826,6 @@ class FirstBreakPicker:
             i1 = min(self.n_samp, i0 + 2)
         ts = slice(i0, i1)
         t_ms = self.times_ms[ts]
-        dx   = self._dx
 
         if self._display_mode in ("vd", "both"):
             d_img = data[:, ts]
@@ -3227,43 +3847,44 @@ class FirstBreakPicker:
         if self._display_mode == "vd":
             return
 
-        # Shared-median normalisation with per-trace clamping.
-        # Using the global median keeps the filter effect visible (filtered
-        # data appears quieter overall vs unfiltered).
-        # Clamping each trace's own std to [median*0.3, median*3] prevents
-        # loud near-offset traces from being over-squashed and dead traces
-        # from being amplified into noise.
-        stds  = np.array([data[i, ts].astype(float).std()
-                          for i in range(self.n_traces)])
+        stds = np.array([data[i, ts].astype(float).std() for i in range(self.n_traces)])
         valid = stds[stds > 1e-20]
-        med   = float(np.median(valid)) if len(valid) else 1.0
+        med = float(np.median(valid)) if len(valid) else 1.0
         norms = np.clip(stds, med * 0.3, med * 3.0)
         norms = np.where(norms > 1e-20, norms, med)
-
-        scale = norms * CLIP_FACTOR   # shape (n_traces,)
+        scale = norms * CLIP_FACTOR
 
         for i, off in enumerate(self.recv_abs):
-            tr   = data[i, ts].astype(float)
+            tr = data[i, ts].astype(float)
             tr_n = np.clip(tr / scale[i], -1.0, 1.0)
-            x_w  = off + tr_n * dx * self._wiggle_stretch
+            x_w = off + tr_n * self._dx * self._wiggle_stretch
             self.ax.plot(x_w, t_ms, color=c["trace"], lw=0.5, alpha=0.85)
             pos = np.where(tr_n > 0.0, tr_n, 0.0)
-            self.ax.fill_betweenx(t_ms, off, off + pos * dx * self._wiggle_stretch,
-                                  color=c["trace"], alpha=c["fill_alpha"])
+            self.ax.fill_betweenx(
+                t_ms,
+                off,
+                off + pos * self._dx * self._wiggle_stretch,
+                color=c["trace"],
+                alpha=c["fill_alpha"],
+            )
 
     def _draw_picks(self):
         c = _tc()
         for idx, t in self._picks.items():
             if idx < len(self.recv_abs):
-                self.ax.plot(self.recv_abs[idx], t, "v",
-                             color=c["pick_clr"], ms=7, zorder=10,
-                             markeredgecolor=c["pick_clr"],
-                             markeredgewidth=0.6)
+                self.ax.plot(
+                    self.recv_abs[idx],
+                    t,
+                    "v",
+                    color=c["pick_clr"],
+                    ms=7,
+                    zorder=10,
+                    markeredgecolor=c["pick_clr"],
+                    markeredgewidth=0.6,
+                )
 
     def _redraw(self):
-        # Remove the previous top axis BEFORE clearing the main axis;
-        # twiny() axes are siblings in the figure and are NOT cleared by ax.clear().
-        if getattr(self, 'ax_top', None) is not None:
+        if getattr(self, "ax_top", None) is not None:
             try:
                 self.ax_top.remove()
             except Exception:
@@ -3275,15 +3896,14 @@ class FirstBreakPicker:
         self.ax.set_facecolor(c["ax_bg"])
         self._draw_traces()
         self._draw_picks()
-        # Shot position marker (vertical) and trigger time (horizontal)
-        self.ax.axvline(self.shot_pos_m, color="#ffcc00", lw=1.2,
-                        ls="--", alpha=0.70, zorder=3)
+
+        self.ax.axvline(self.shot_pos_m, color="#ffcc00", lw=1.2, ls="--", alpha=0.70, zorder=3)
+
         if self._show_timelines:
-            self.ax.axhline(0.0, color="#00aa66", lw=1.0,
-                            ls=":", alpha=0.75, zorder=3)
+            self.ax.axhline(0.0, color="#00aa66", lw=1.0, ls=":", alpha=0.75, zorder=3)
             for ms in range(10, int(self._t_view_end) + 1, 10):
                 if self._t_view_start <= float(ms) <= self._t_view_end:
-                    major = (ms % 20 == 0)
+                    major = ms % 20 == 0
                     self.ax.axhline(
                         float(ms),
                         color="#666666" if THEME == "light" else "#aaaaaa",
@@ -3294,85 +3914,87 @@ class FirstBreakPicker:
                     )
 
         margin = self._dx * 0.5
-        self.ax.set_xlim(self.recv_abs.min() - margin,
-                         self.recv_abs.max() + margin)
-        # Y-axis: time increases downward; 0 ms at top, T_MAX_MS at bottom
+        self.ax.set_xlim(self.recv_abs.min() - margin, self.recv_abs.max() + margin)
         self.ax.set_ylim(self._t_view_end, self._t_view_start)
 
-        dt_ms  = self.dt_s * 1000.0
+        dt_ms = self.dt_s * 1000.0
         n_samp = self.n_samp
-        t_end  = self.delay_ms + (n_samp - 1) * dt_ms
+        t_end = self.delay_ms + (n_samp - 1) * dt_ms
         if self._filter_mode == "ormsby":
             filt_str = f"Ormsby {self._f1:.0f}-{self._f2:.0f}-{self._f3:.0f}-{self._f4:.0f} Hz"
         elif self._filter_mode == "butter":
             filt_str = f"Butterworth order {self._butter_order} ({self._f2:.0f}-{self._f3:.0f} Hz)"
+        elif self._filter_mode == "cutpass":
+            filt_str = f"Cut/Pass order {self._butter_order} (low f1={self._f1:.0f} Hz, high f4={self._f4:.0f} Hz)"
         else:
             filt_str = "Filter none"
         if self._inverted:
-            filt_str += "  [INV]"
-        title = (f"Profile: {self.profile}  |  Shot {self.shot_id}  |"
-                 f"  {n_samp} smp  dt={dt_ms:.4f} ms  "
-                 f"delay={self.delay_ms:.1f} ms  end={t_end:.1f} ms  |"
-                 f"  {len(self._picks)}/{self.n_traces} picks  |  {filt_str}"
-                 f"  | gain={self._gain_mode}")
+            filt_str += " [INV]"
+        title = (
+            f"Profile {self.profile} | Shot {self.shot_id} | {n_samp} smp "
+            f"dt={dt_ms:.4f} ms delay={self.delay_ms:.1f} ms end={t_end:.1f} ms "
+            f"| {len(self._picks)}/{self.n_traces} picks | {filt_str} | gain={self._gain_mode} | mode={self._auto_pick_mode} | order={self._pick_order}"
+        )
         self.ax.set_title(title, color=c["text"], fontsize=9)
         self.ax.set_xlabel("Receiver position (m)", color=c["label"], fontsize=8)
+        self.ax.set_ylabel("Time (ms)", color=c["label"])
+
         self.ax.text(
-            0.0, -0.14,
-            "L:pick  R:delete  Shift+L:range  a:auto  f:filter mode  g:gain  v:polarity  l:timeline  c:top axis  s/n:save+next  p:prev  q:quit",
+            0.0,
+            -0.14,
+            "L:pick R:delete Shift+L:range a:auto x:apply f:filter g:gain o:mode r:order h:hilbert v:polarity l:timeline c:top axis s/n:save+next p:prev q:quit",
             transform=self.ax.transAxes,
-            ha="left", va="top",
-            color=c["label"], fontsize=7,
+            ha="left",
+            va="top",
+            color=c["label"],
+            fontsize=7,
             clip_on=False,
         )
-        self.ax.set_ylabel("Time  (ms)", color=c["label"])
+
         self.ax.grid(True, lw=0.3, alpha=0.30, color=c["grid"])
         self.ax.tick_params(colors=c["tick"])
         for sp in self.ax.spines.values():
             sp.set_edgecolor(c["spine"])
-        handle = Line2D([0], [0], marker="v", linestyle="none",
-                        color=c["pick_clr"], markersize=7,
-                        label="First-break pick")
-        self.ax.legend(handles=[handle], fontsize=8,
-                       facecolor=c["leg_face"], edgecolor=c["leg_edge"],
-                       labelcolor=c["text"], loc="lower right")
 
-        # ---- Top axis: channel numbers (default) or signed offset from shot ----
-        # twiny() shares the y-axis, giving an independent x-axis at the top.
-        # We set matching xlim and place ticks at actual receiver positions so
-        # the labels are exact regardless of whether spacing is uniform or not.
+        handle = Line2D([0], [0], marker="v", linestyle="none", color=c["pick_clr"], markersize=7, label="First-break pick")
+        self.ax.legend(
+            handles=[handle],
+            fontsize=8,
+            facecolor=c["leg_face"],
+            edgecolor=c["leg_edge"],
+            labelcolor=c["text"],
+            loc="lower right",
+        )
+
         ax_top = self.ax.twiny()
         ax_top.set_xlim(self.ax.get_xlim())
         n_recv = len(self.recv_abs)
-        step   = max(1, n_recv // 8)          # aim for ~8-10 tick labels
-        idxs   = list(range(0, n_recv, step))
+        step = max(1, n_recv // 8)
+        idxs = list(range(0, n_recv, step))
         if (n_recv - 1) not in idxs:
             idxs.append(n_recv - 1)
 
         if self._top_mode == "channel":
             ax_top.set_xticks(self.recv_abs[idxs])
             ax_top.set_xticklabels([str(i + 1) for i in idxs], fontsize=7)
-            ax_top.set_xlabel("Channel   [c -> offset]",
-                              color=c["label"], fontsize=8)
+            ax_top.set_xlabel("Channel [c -> offset]", color=c["label"], fontsize=8)
         else:
             spm = self.shot_pos_m
             ax_top.set_xticks(self.recv_abs[idxs])
-            ax_top.set_xticklabels(
-                [f"{self.recv_abs[i] - spm:+.0f}" for i in idxs], fontsize=7)
-            ax_top.set_xlabel("Signed offset from shot (m)   [c -> channel]",
-                              color=c["label"], fontsize=8)
+            ax_top.set_xticklabels([f"{self.recv_abs[i] - spm:+.0f}" for i in idxs], fontsize=7)
+            ax_top.set_xlabel("Signed offset from shot (m) [c -> channel]", color=c["label"], fontsize=8)
 
         ax_top.tick_params(colors=c["tick"], labelsize=7)
         for sp in ax_top.spines.values():
             sp.set_edgecolor(c["spine"])
+
         self.ax_top = ax_top
 
         ffid = self._header_info.get("ffid", "?")
         ntr = self._header_info.get("n_tr", self.n_traces)
         nsamp = self._header_info.get("n_samp", self.n_samp)
-        s_hdr = self._header_info.get("shot_pos_hdr", None)
         info_block = (
-            r"$\bf{Header\ Info}$" + "\n"
+            "Header Info\n"
             f"FFID           : {ffid}\n"
             f"Traces         : {ntr}\n"
             f"Samples        : {nsamp}\n"
@@ -3381,9 +4003,14 @@ class FirstBreakPicker:
             f"Shot (m)       : {self.shot_pos_m:.2f}\n"
             f"Gain           : {self._gain_mode} ({self._agc_stat}, {self._agc_window_ms:.0f} ms)\n"
             f"Display / Scale: {self._display_mode} / {self._wiggle_stretch:.2f}\n"
+            f"Auto mode      : {self._auto_pick_mode}\n"
+            f"Hilbert target  : {self._hilbert_target}\n"
+            f"Pick order      : {self._pick_order}\n"
             f"Filter mode    : {self._filter_mode}\n"
             f"Ormsby (Hz)    : {self._f1:.1f}-{self._f2:.1f}-{self._f3:.1f}-{self._f4:.1f}\n"
             f"Butter (Hz)    : {self._f2:.1f}-{self._f3:.1f} (order {self._butter_order})\n"
+            f"Cut/Pass (Hz)  : low=f1={self._f1:.1f}, high=f4={self._f4:.1f} (order {self._butter_order})\n"
+            f"Time corr (ms) : delay includes +{TRIGGER_STATIC_MS:.2f}; residual +{TRIGGER_MS_PER_M:.5f}*offset(m)\n"
             f"Time view (ms) : {self._t_view_start:.1f} .. {self._t_view_end:.1f}\n"
             f"Polarity       : {'inverse' if self._inverted else 'normal'}\n"
             f"Timelines      : {'on' if self._show_timelines else 'off'}"
@@ -3396,35 +4023,30 @@ class FirstBreakPicker:
         self.fig.patch.set_facecolor(c["fig_bg"])
         self.fig.canvas.draw_idle()
 
-    # ---- events ------------------------------------------------------------
-
     def _nearest_idx(self, x: float) -> int:
         return int(np.abs(self.recv_abs - x).argmin())
 
     def _on_click(self, event: Any):
-        # twiny() creates an overlay axis (ax_top) at the same figure position as
-        # self.ax.  On Windows/TkAgg, mouse events are routed to whichever axes
-        # was created last, so event.inaxes is often ax_top, not self.ax.
-        # Fix: accept either axis, then convert pixel coordinates to self.ax
-        # data space so xdata/ydata are always in the correct (geometry) units.
-        ax_top_ref  = self.ax_top          # may be None before first _redraw
-        valid_axes  = (self.ax,) if ax_top_ref is None else (self.ax, ax_top_ref)
+        ax_top_ref = self.ax_top
+        valid_axes = (self.ax,) if ax_top_ref is None else (self.ax, ax_top_ref)
         if event.inaxes not in valid_axes or event.x is None or event.y is None:
             return
+
         try:
-            xdata, ydata = self.ax.transData.inverted().transform(
-                (event.x, event.y))
+            xdata, ydata = self.ax.transData.inverted().transform((event.x, event.y))
         except Exception:
             if event.xdata is None or event.ydata is None:
                 return
             xdata, ydata = event.xdata, event.ydata
+
         idx = self._nearest_idx(xdata)
         if event.key == "shift" and event.button == 1:
             self._range_fill(idx, float(ydata))
             self._redraw()
             return
+
         if event.button == 1:
-            t = round(float(ydata), 2)
+            t = round(float(self._snap_pick_time_ms(idx, float(ydata))), 2)
             if self._t_view_start <= t <= self._t_view_end:
                 self._picks[idx] = t
                 self._drag_pick = True
@@ -3435,22 +4057,27 @@ class FirstBreakPicker:
             self._drag_delete = True
             self._last_drag_idx = idx
             self._last_drag_t = None
+
         self._redraw()
 
     def _on_motion(self, event: Any):
         if not (self._drag_pick or self._drag_delete):
             return
+
         ax_top_ref = self.ax_top
         valid_axes = (self.ax,) if ax_top_ref is None else (self.ax, ax_top_ref)
         if event.inaxes not in valid_axes or event.x is None or event.y is None:
             return
+
         try:
             xdata, ydata = self.ax.transData.inverted().transform((event.x, event.y))
         except Exception:
             return
+
         idx = self._nearest_idx(xdata)
+
         if self._drag_pick:
-            t = round(float(ydata), 2)
+            t = round(float(self._snap_pick_time_ms(idx, float(ydata))), 2)
             if self._last_drag_idx is None:
                 if self._t_view_start <= t <= self._t_view_end:
                     self._picks[idx] = t
@@ -3471,8 +4098,10 @@ class FirstBreakPicker:
                 ti = round(float(prev_t + frac * (t - prev_t)), 2)
                 if self._t_view_start <= ti <= self._t_view_end:
                     self._picks[ii] = ti
+
             self._last_drag_idx = idx
             self._last_drag_t = t
+
         elif self._drag_delete:
             if self._last_drag_idx is None:
                 self._picks.pop(idx, None)
@@ -3483,11 +4112,14 @@ class FirstBreakPicker:
             prev_idx = int(self._last_drag_idx)
             if idx == prev_idx:
                 return
+
             lo, hi = (prev_idx, idx) if prev_idx < idx else (idx, prev_idx)
             for ii in range(lo, hi + 1):
                 self._picks.pop(ii, None)
+
             self._last_drag_idx = idx
             self._last_drag_t = None
+
         self._redraw()
 
     def _on_release(self, _event: Any):
@@ -3502,22 +4134,25 @@ class FirstBreakPicker:
             return
         if self._range_anchor is None:
             self._range_anchor = (idx, t)
-            print(f"     Range anchor set at trace {idx+1}, t={t:.2f} ms")
+            print(f"     Range anchor set at trace {idx + 1}, t={t:.2f} ms")
             return
+
         i0, t0 = self._range_anchor
         i1, t1 = idx, t
         if i0 == i1:
             self._picks[i0] = t1
             self._range_anchor = None
             return
+
         lo, hi = (i0, i1) if i0 < i1 else (i1, i0)
         for ii in range(lo, hi + 1):
             frac = (ii - i0) / float(i1 - i0)
             tt = round(float(t0 + frac * (t1 - t0)), 2)
             if self._t_view_start <= tt <= self._t_view_end:
                 self._picks[ii] = tt
+
         self._range_anchor = None
-        print(f"     Range fill: traces {lo+1}-{hi+1}")
+        print(f"     Range fill: traces {lo + 1}-{hi + 1}")
 
     def _save_and_finish(self, nav: str):
         if self._save_callback is not None:
@@ -3548,8 +4183,10 @@ class FirstBreakPicker:
             self._cancelled = True
             self._nav_action = "quit"
             self._done = True
-            try: self.fig.canvas.stop_event_loop()
-            except Exception: pass
+            try:
+                self.fig.canvas.stop_event_loop()
+            except Exception:
+                pass
         elif key == "s":
             self._save_and_finish("finalize")
         elif key == "n":
@@ -3557,12 +4194,9 @@ class FirstBreakPicker:
         elif key == "p":
             self._go_prev()
         elif key == "k":
-            # Save a per-shot QC screenshot (separate from pick-saving)
             self._save_qc_image()
         elif key == "f":
-            self._filter_mode = {"none": "butter", "butter": "ormsby", "ormsby": "none"}.get(
-                self._filter_mode, "none"
-            )
+            self._filter_mode = {"none": "butter", "butter": "ormsby", "ormsby": "cutpass", "cutpass": "none"}.get(self._filter_mode, "none")
             self._refresh_mode_buttons()
             self._redraw()
         elif key == "u":
@@ -3578,9 +4212,30 @@ class FirstBreakPicker:
             self._f3 = max(self._f2 + 1.0, self._f3 - 5.0)
             self._schedule_filter_update()
         elif key == "g":
-            self._gain_mode = ({"none": "norm", "norm": "agc", "agc": "none"}
-                               .get(self._gain_mode, "none"))
+            self._gain_mode = {"none": "norm", "norm": "agc", "agc": "none"}.get(self._gain_mode, "none")
             self._redraw()
+        elif key == "o":
+            self._auto_pick_mode = {
+                "stalta": "maxdiff_zero",
+                "maxdiff_zero": "hilbert_env",
+                "hilbert_env": "stalta",
+            }.get(self._auto_pick_mode, "stalta")
+            self._refresh_mode_buttons()
+            self._redraw()
+        elif key == "r":
+            self._pick_order = {
+                "F>G>X": "G>F>X",
+                "G>F>X": "RAW>X",
+                "RAW>X": "F>G>X",
+            }.get(self._pick_order, "F>G>X")
+            self._refresh_mode_buttons()
+            self._redraw()
+        elif key == "h":
+            self._hilbert_target = {"onset": "peak", "peak": "onset"}.get(self._hilbert_target, "onset")
+            self._refresh_mode_buttons()
+            self._redraw()
+        elif key == "x":
+            self._apply_current_settings_to_picks()
         elif key == "v":
             self._toggle_invert()
         elif key == "l":
@@ -3596,17 +4251,26 @@ class FirstBreakPicker:
             self._redraw()
 
     def _auto_pick(self):
+        mode = str(self._auto_pick_mode).strip().lower()
+        if mode == "maxdiff_zero":
+            self._auto_pick_maxdiff_zero()
+            return
+        if mode == "hilbert_env":
+            self._auto_pick_hilbert_env()
+            return
+        self._auto_pick_stalta()
+
+    def _auto_pick_stalta(self):
         data = self._active_data()
         count = 0
         n_sta = max(1, int(STA_MS / 1000.0 / self.dt_s))
         n_lta = max(3, int(LTA_MS / 1000.0 / self.dt_s))
         start_idx = max(0, int((0.0 - self.delay_ms) / (self.dt_s * 1000.0)))
-        end_idx = min(self.n_samp - n_sta - 1,
-                      int((self._t_view_end - self.delay_ms) / (self.dt_s * 1000.0)))
+        end_idx = min(self.n_samp - n_sta - 1, int((self._t_view_end - self.delay_ms) / (self.dt_s * 1000.0)))
 
         for i in range(self.n_traces):
             tr = data[i].astype(float)
-            tr = tr - np.mean(tr[:max(1, n_lta)])
+            tr = tr - np.mean(tr[: max(1, n_lta)])
             char = np.maximum(tr, 0.0)
             search_lo = max(n_lta, start_idx)
             search_hi = max(search_lo + 2, end_idx)
@@ -3614,82 +4278,107 @@ class FirstBreakPicker:
             noise_floor = float(np.median(local_char)) if local_char.size else 0.0
             amp_floor = max(1e-12, 4.0 * noise_floor)
             picked_idx = None
+
             for k in range(search_lo, search_hi - 1):
-                lta = char[k - n_lta:k].mean()
+                lta = char[k - n_lta : k].mean()
                 if lta < 1e-30:
                     continue
-                sta = char[k:k + n_sta].mean()
+                sta = char[k : k + n_sta].mean()
                 ratio = sta / lta
-                next_lta = char[k + 1 - n_lta:k + 1].mean()
+                next_lta = char[k + 1 - n_lta : k + 1].mean()
                 if next_lta < 1e-30:
                     continue
-                next_sta = char[k + 1:k + 1 + n_sta].mean()
+                next_sta = char[k + 1 : k + 1 + n_sta].mean()
                 next_ratio = next_sta / next_lta
                 if ratio >= STALTA_TRIG and next_ratio >= STALTA_TRIG and sta >= amp_floor:
                     picked_idx = k
                     break
+
             if picked_idx is None:
                 continue
 
             t_abs = round(self.delay_ms + picked_idx * self.dt_s * 1000.0, 2)
+            t_abs = float(t_abs) + self._timing_correction_ms(i)
             if self._t_view_start <= t_abs <= self._t_view_end:
                 self._picks[i] = t_abs
                 count += 1
 
-        print(f"     Auto-pick: {count}/{self.n_traces} placed (gain-aware).")
+        print(f"     Auto-pick (stalta): {count}/{self.n_traces} placed")
+
+    def _auto_pick_maxdiff_zero(self):
+        count = 0
+        for i in range(self.n_traces):
+            tr = self._prepare_trace_for_pick(self.data_raw[i])
+            abs_lo_ms, abs_hi_ms = self._auto_abs_gate_ms_for_trace(i)
+            win_start_s = max(0.0, (abs_lo_ms - float(self.delay_ms)) / 1000.0)
+            win_end_s = max(win_start_s + self.dt_s, (abs_hi_ms - float(self.delay_ms)) / 1000.0)
+            t_s = _zero_crossing_from_extremum_samples(
+                samples=tr,
+                dt_s=self.dt_s,
+                win_start_s=win_start_s,
+                win_end_s=win_end_s,
+                search_direction=ZERO_X_SEARCH_DIRECTION,
+                use_abs_peak=True,
+            )
+            if t_s is None:
+                continue
+            t_abs = round(self.delay_ms + (t_s * 1000.0) + self._timing_correction_ms(i), 2)
+            if self._t_view_start <= t_abs <= self._t_view_end:
+                self._picks[i] = t_abs
+                count += 1
+        print(f"     Auto-pick (maxdiff_zero): {count}/{self.n_traces} placed")
+
+    def _auto_pick_hilbert_env(self):
+        count = 0
+        for i in range(self.n_traces):
+            abs_lo_ms, abs_hi_ms = self._auto_abs_gate_ms_for_trace(i)
+            win_start_s = max(0.0, (abs_lo_ms - float(self.delay_ms)) / 1000.0)
+            win_end_s = max(win_start_s + self.dt_s, (abs_hi_ms - float(self.delay_ms)) / 1000.0)
+            tr = Trace(data=np.asarray(self._prepare_trace_for_pick(self.data_raw[i]), dtype=np.float32))
+            tr.stats.delta = float(self.dt_s)
+            _, peak_time_s, onset_time_s = hilbert_envelope_pick(
+                trace=tr,
+                win_start_s=win_start_s,
+                win_end_s=win_end_s,
+                onset_pct=HILBERT_ONSET_PCT,
+            )
+            if self._hilbert_target == "peak":
+                t_s = peak_time_s if peak_time_s is not None else onset_time_s
+            else:
+                t_s = onset_time_s if onset_time_s is not None else peak_time_s
+            if t_s is None:
+                continue
+            t_abs = round(self.delay_ms + (float(t_s) * 1000.0) + self._timing_correction_ms(i), 2)
+            if self._t_view_start <= t_abs <= self._t_view_end:
+                self._picks[i] = t_abs
+                count += 1
+        print(f"     Auto-pick (hilbert_env): {count}/{self.n_traces} placed")
 
     def _save_qc_image(self):
-        """Save the main plot area only (without control widgets) as PNG."""
         self.qc_dir.mkdir(parents=True, exist_ok=True)
         out = self.qc_dir / f"{self.profile}_shot{self.shot_id:02d}_picks.png"
         self.fig.canvas.draw()
         renderer = self.fig.canvas.get_renderer()
         bbox = self.ax.get_tightbbox(renderer).expanded(1.02, 1.04)
         bbox_inches = bbox.transformed(self.fig.dpi_scale_trans.inverted())
-        self.fig.savefig(str(out), dpi=180, bbox_inches=bbox_inches,
-                         facecolor=self.ax.get_facecolor())
+        self.fig.savefig(str(out), dpi=180, bbox_inches=bbox_inches, facecolor=self.ax.get_facecolor())
         print(f"\n     QC image -> {out.name}")
 
-    # ---- public ------------------------------------------------------------
-
-    @property
-    def picks_ms(self) -> dict:
-        return self._picks
-
     def run(self) -> Any:
-        """
-        Show exactly ONE picker window and block until it is done.
-
-        Why this approach:
-        - plt.show(block=True) on Windows/TkAgg re-enters mainloop().
-          If the first mainloop() was already stopped by plt.close(), the
-          second call may not block, causing all 3 shot figures to be created
-          before any are shown (6-window bug).
-        - canvas.start_event_loop(timeout) runs the backend event loop for
-          exactly `timeout` seconds per call, then returns.  This gives a
-          tightly-controlled poll loop that is fully responsive.
-        - Key handlers set self._done = True and call stop_event_loop() to
-          return the current start_event_loop call immediately (no plt.close
-          inside key handlers).
-        - plt.close() is called by run() AFTER the loop exits, exactly once.
-
-        Returns raw picks {trace_idx: ms from trigger} or None if cancelled.
-        """
         self._done = False
 
         def _on_close(_evt: Any):
-            # Fired when the user clicks the window X button
             if not (self._saved or self._cancelled):
                 self._cancelled = True
             self._done = True
-            try: self.fig.canvas.stop_event_loop()
-            except Exception: pass
+            try:
+                self.fig.canvas.stop_event_loop()
+            except Exception:
+                pass
 
         self.fig.canvas.mpl_connect("close_event", _on_close)
-        plt.show(block=False)   # display this figure (non-blocking)
+        plt.show(block=False)
 
-        # Poll in short chunks; each chunk runs the native event loop so the
-        # window remains fully interactive
         while not self._done:
             try:
                 self.fig.canvas.start_event_loop(0.05)
@@ -3697,7 +4386,6 @@ class FirstBreakPicker:
                 self._cancelled = True
                 break
 
-        # Close the figure if still open (X button may have already closed it)
         try:
             if plt.fignum_exists(self.fig.number):
                 plt.close(self.fig)
@@ -3707,7 +4395,6 @@ class FirstBreakPicker:
         if self._cancelled:
             return {"status": "quit", "picks": self._picks}
         return {"status": self._nav_action or "next", "picks": self._picks}
-
 
 # ---------------------------------------------------------------------------
 # Picks persistence  (JSON -- always RAW, no static applied)
@@ -4655,7 +5342,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                 """Called on nav/finalize to persist temporary session progress."""
                 all_picks[_sid] = picks_for_shot
                 save_session_picks_json(profile_name, all_picks)
-                print(f"     ✓ {len(picks_for_shot)} pick(s) saved to session.")
+                print(f"     âœ“ {len(picks_for_shot)} pick(s) saved to session.")
 
             picker = FirstBreakPicker(
                 data_slice, data_filt, dt_s,
@@ -5444,4 +6131,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
