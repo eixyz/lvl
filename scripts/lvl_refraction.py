@@ -721,6 +721,7 @@ def export_velocity_summary_excel(profile_name: str,
         "V0E", "V0C", "V0", "H0", "V1", "TI1", "H1", "V2", "TI2", "DR",
         "LINE_LENGTH_SP_M", "LINE_LENGTH_M", "MIDDLE_STATION", "ACQ_DATETIME_DE",
         "V0_LEFT", "V0_RIGHT", "V1_LEFT", "V1_CENTER", "V1_RIGHT", "V2_LEFT", "V2_CENTER", "V2_RIGHT",
+        "PROCESSED_ON",
     ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -864,6 +865,7 @@ def export_velocity_summary_excel(profile_name: str,
         round(_get_v(sid_l, "V2_m_s"), 3),
         round(_get_v(sid_m, "V2_m_s"), 3),
         round(_get_v(sid_r, "V2_m_s"), 3),
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     ]
     name_col = 2
     legacy_line_val = cfg.get("line_no", None)
