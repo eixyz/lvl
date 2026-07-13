@@ -1,5 +1,27 @@
 # lvl_refraction.py - Full Function Documentation
 
+User-facing run/field interpretation guide:
+- lvl/scripts/lvl_refraction_INSTRUCTIONS.md
+- lvl/scripts/lvl_studio_INSTRUCTIONS.md
+
+Project purpose overview:
+- lvl/README.md
+
+Standalone GUI command center (single GUI module):
+- lvl/scripts/lvl_command_center.py
+
+Independent workstation app (new program):
+- lvl/scripts/lvl_studio.py
+
+Shared module layer (GUI/backend decoupling):
+- lvl/scripts/lvl_modules/app_paths.py
+- lvl/scripts/lvl_modules/run_config.py
+- lvl/scripts/lvl_modules/control_bridge.py
+
+Removed legacy GUI variants:
+- lvl/scripts/lvl_gui_pyqt.py
+- lvl/scripts/lvl_refraction_gui_support.py
+
 This document explains why each major function/class exists in `lvl_refraction.py` and where it fits in the workflow.
 
 The script is organized as:
@@ -61,10 +83,21 @@ The script is organized as:
 - `load_midpoint_xyz_from_geometry_excels(profile_name, station_mid, excel_paths)`
   - Why: fetches midpoint coordinates for summary export; repeated station rows use last occurrence.
 
+- `load_profile_geometry_from_excels(profile_name, excel_paths)`
+  - Why: computes profile line length from LVL station XY polyline and resolves midpoint station coordinates.
+  - Duplicate station rows are resolved with "last row wins".
+  - Also extracts a sheet-level acquisition date/time (if available) and normalizes to German timezone text.
+
 ## 4) Summary export
 
 - `export_velocity_summary_excel(...)`
-  - Why: appends/updates one profile row in consolidated summary workbook with line/length/XYZ/velocities/times/depths.
+  - Why: appends/updates one profile row in consolidated summary workbook with:
+    - requested copy-friendly lead columns:
+      NUM, NAME, SP, SPREAD, X_UTM, Y_UTM, ELEV,
+      V0E, V0C, V0, H0, V1, TI1, H1, V2, TI2, DR
+    - plus appended traceability fields (LINE_LENGTH_SP_M, LINE_LENGTH_M, middle station, datetime, side-specific velocities).
+  - Coordinate source order: SEG2 (middle shot) if available, otherwise LVL Excel midpoint.
+  - Date source order: LVL Excel sheet date/datum first, SEG2 middle-shot time fallback.
   - Includes fallback filename if workbook is locked by Excel.
 
 ## 5) Field-report readers
@@ -109,6 +142,9 @@ The script is organized as:
 
 - `read_seg2(path)`
   - Why: loads SEG2 traces plus key metadata (FFID, delay, shot location, receiver locations).
+
+- `read_seg2_acquisition_time_de(path, tz_name="Europe/Berlin")`
+  - Why: extracts SEG2 acquisition timestamp and formats it in German local timezone (CET/CEST).
 
 - `_ormsby_response(...)`, `ormsby(...)`, `apply_ormsby_all(...)`, `apply_ormsby_all_params(...)`
   - Why: ProMAX-like Ormsby filtering functions.
@@ -242,6 +278,9 @@ Why: robust resume/finalize behavior for both picks and layer fits.
 
 - `main()`
   - Why: CLI parsing, report discovery, target profile selection, batch execution.
+  - Extra options exposed for GUI integration:
+    - `--coord-excel` for explicit coordinate workbook path(s)
+    - `--device-type` (sw_maps/geomax)
 
 ## Runtime flow summary
 

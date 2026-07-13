@@ -76,6 +76,8 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+from lvl_modules.control_bridge import read_latest_picker_command
 
 # ---------------------------------------------------------------------------
 # Auto-install missing packages into the active environment
@@ -551,6 +553,157 @@ def load_midpoint_xyz_from_geometry_excels(profile_name: str,
     return best_xyz[0], best_xyz[1], best_xyz[2], best_file
 
 
+def load_profile_geometry_from_excels(profile_name: str,
+                                      excel_paths: list) -> tuple:
+    """
+    Load profile geometry summary from LVL geometry spreadsheets.
+
+    Returns
+    -------
+    (length_m, x_mid, y_mid, z_mid, source_file, station_min, station_mid, station_max, acq_datetime_de)
+
+    Notes
+    -----
+    - Repeated station entries use the last row value.
+    - Length is computed along sorted station order using XY polyline distance.
+    - Midpoint coordinate is taken at station nearest to the midpoint station.
+    """
+    target = _normalize_profile_token(profile_name)
+    best_by_station: dict = {}
+    best_file = None
+    best_acq_dt_de = None
+    best_span = -1.0
+    best_count = -1
+
+    def _parse_excel_datetime(v: Any) -> datetime.datetime | None:
+        if v is None:
+            return None
+        if isinstance(v, datetime.datetime):
+            return v
+        if isinstance(v, datetime.date):
+            return datetime.datetime(v.year, v.month, v.day, 0, 0, 0)
+        s = str(v).strip()
+        if not s:
+            return None
+        for fmt in (
+            "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+            "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+            "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d",
+        ):
+            try:
+                return datetime.datetime.strptime(s, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _extract_sheet_acq_datetime_de(df: Any, hdr_row: int) -> str | None:
+        tz = ZoneInfo("Europe/Berlin")
+        max_rows = min(int(df.shape[0]), max(40, hdr_row + 8))
+        max_cols = int(df.shape[1])
+
+        def _to_local_text(dt_val: datetime.datetime) -> str:
+            if dt_val.tzinfo is None:
+                dt_local = dt_val.replace(tzinfo=tz)
+            else:
+                dt_local = dt_val.astimezone(tz)
+            return dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        labels = ("datum", "date", "acquisition")
+        for r in range(max_rows):
+            for c in range(max_cols):
+                txt = str(df.iat[r, c] if c < df.shape[1] else "").strip().lower()
+                if not txt:
+                    continue
+                if any(lbl in txt for lbl in labels):
+                    cand_vals = []
+                    if c + 1 < max_cols:
+                        cand_vals.append(df.iat[r, c + 1])
+                    if c + 2 < max_cols:
+                        cand_vals.append(df.iat[r, c + 2])
+                    if r + 1 < max_rows:
+                        cand_vals.append(df.iat[r + 1, c])
+                    for cv in cand_vals:
+                        dtv = _parse_excel_datetime(cv)
+                        if dtv is not None:
+                            return _to_local_text(dtv)
+
+        for r in range(max_rows):
+            for c in range(max_cols):
+                dtv = _parse_excel_datetime(df.iat[r, c])
+                if dtv is not None:
+                    return _to_local_text(dtv)
+        return None
+
+    for path in excel_paths:
+        try:
+            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+        except Exception:
+            continue
+
+        for _sheet_name, df in sheets.items():
+            cols = _find_station_xyz_columns(df)
+            if cols is None:
+                continue
+            hdr_row, i_prof, i_sta, i_x, i_y, i_z = cols
+            acq_dt_de = _extract_sheet_acq_datetime_de(df, hdr_row)
+
+            by_station: dict = {}
+            for ridx in range(hdr_row + 1, int(df.shape[0])):
+                p_raw = df.iat[ridx, i_prof] if i_prof < df.shape[1] else None
+                if _normalize_profile_token(p_raw) != target:
+                    continue
+
+                s_raw = df.iat[ridx, i_sta] if i_sta < df.shape[1] else None
+                x_raw = df.iat[ridx, i_x] if i_x < df.shape[1] else None
+                y_raw = df.iat[ridx, i_y] if i_y < df.shape[1] else None
+                z_raw = df.iat[ridx, i_z] if i_z < df.shape[1] else None
+
+                sta = _to_float_or_none(s_raw)
+                x = _to_float_or_none(x_raw)
+                y = _to_float_or_none(y_raw)
+                z = _to_float_or_none(z_raw)
+                if sta is None or x is None or y is None or z is None:
+                    continue
+
+                # Last row wins for repeated station values.
+                by_station[float(sta)] = (float(x), float(y), float(z))
+
+            if not by_station:
+                continue
+
+            st_sorted = sorted(by_station)
+            span = float(st_sorted[-1] - st_sorted[0]) if len(st_sorted) >= 2 else 0.0
+            cnt = int(len(st_sorted))
+            if (span > best_span) or (math.isclose(span, best_span) and cnt > best_count):
+                best_span = span
+                best_count = cnt
+                best_by_station = by_station
+                best_file = path
+                best_acq_dt_de = acq_dt_de
+
+    if not best_by_station:
+        return None, None, None, None, None, None, None, None, None
+
+    stations = sorted(best_by_station)
+    s_min = float(stations[0])
+    s_max = float(stations[-1])
+    s_mid = 0.5 * (s_min + s_max)
+
+    s_near = min(stations, key=lambda s: abs(float(s) - s_mid))
+    x_mid, y_mid, z_mid = best_by_station[float(s_near)]
+
+    length_m = 0.0
+    for i in range(1, len(stations)):
+        x0, y0, _z0 = best_by_station[float(stations[i - 1])]
+        x1, y1, _z1 = best_by_station[float(stations[i])]
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        length_m += float(math.sqrt(dx * dx + dy * dy))
+
+    return float(length_m), float(x_mid), float(y_mid), float(z_mid), best_file, s_min, s_mid, s_max, best_acq_dt_de
+
+
 def export_velocity_summary_excel(profile_name: str,
                                   cfg: dict,
                                   recv_positions: Any,
@@ -559,34 +712,37 @@ def export_velocity_summary_excel(profile_name: str,
                                   analysis: dict,
                                   output_dir: Path,
                                   geometry_excel_paths: list | None = None,
-                                  filename: str = "lvl_velocity_summary.xlsx") -> Path:
+                                  filename: str = "lvl_velocity_summary.xlsx",
+                                  acquisition_time_de: str | None = None,
+                                  seg2_mid_xyz: tuple | None = None) -> Path:
     """Write/append one profile row to a consolidated velocity summary workbook."""
+    headers = [
+        "NUM", "NAME", "SP", "SPREAD", "X_UTM", "Y_UTM", "ELEV",
+        "V0E", "V0C", "V0", "H0", "V1", "TI1", "H1", "V2", "TI2", "DR",
+        "LINE_LENGTH_SP_M", "LINE_LENGTH_M", "MIDDLE_STATION", "ACQ_DATETIME_DE",
+        "V0_LEFT", "V0_RIGHT", "V1_LEFT", "V1_CENTER", "V1_RIGHT", "V2_LEFT", "V2_CENTER", "V2_RIGHT",
+    ]
+
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / filename
     if out_path.exists():
         wb = openpyxl.load_workbook(str(out_path))
         ws = wb.active
+        for ci, h in enumerate(headers, start=1):
+            old_h = ws.cell(row=1, column=ci).value
+            if str(old_h).strip() != str(h):
+                _chdr(ws, 1, ci, h)
     else:
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Summary"
-        headers = [
-            "Line", "Length_m", "X", "Y", "Z_Ortho_m",
-            "V0L", "V0M", "V0R", "V0A",
-            "V1L", "V1M", "V1R", "V1A",
-            "t1_ms", "D1_m",
-            "V2L", "V2M", "V2R", "V2A",
-            "t2_ms", "D2_m", "D1_plus_D2_m",
-        ]
         for ci, h in enumerate(headers, start=1):
             _chdr(ws, 1, ci, h)
 
     def _highlight_summary_headers() -> None:
         # Emphasize average/depth/intercept-time fields in the summary header row.
         target_headers = {
-            "V0A", "V1A", "V2A",
-            "t1_ms", "t2_ms",
-            "D1_m", "D2_m", "D1_plus_D2_m",
+            "V0", "H0", "V1", "TI1", "H1", "V2", "TI2", "DR",
         }
         fill = PatternFill("solid", fgColor="FFD966")
         font = Font(bold=True, color="000000")
@@ -624,68 +780,133 @@ def export_velocity_summary_excel(profile_name: str,
     d1 = float(avg.get("h1_m", 0.0) or 0.0)
     d2 = float(avg.get("h2_m", 0.0) or 0.0)
 
-    # Use the profile token as the exported line label (e.g., "150" instead of legacy numeric ids).
-    line_val = str(profile_name).strip()
-    line_new_val = f"{line_val}_new"
-    length_m = float(abs(float(recv_positions[-1]) - float(recv_positions[0]))) if len(recv_positions) >= 2 else 0.0
-    station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
-    x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
-        profile_name,
-        station_mid=station_mid,
+    name_base = f"LVL{str(profile_name).strip()}"
+    name_new = f"{name_base}_new"
+    sp_count = int(len(shots_info or []))
+    profile_len_shot_points_m = float(abs(float(recv_positions[-1]) - float(recv_positions[0]))) if len(recv_positions) >= 2 else 0.0
+    line_length_m = float(profile_len_shot_points_m)
+    x_mid = y_mid = z_mid = None
+    src = None
+    acq_dt_final = acquisition_time_de
+
+    g_len, gx, gy, gz, gsrc, s_min, s_mid, s_max, acq_dt_excel = load_profile_geometry_from_excels(
+        profile_name=profile_name,
         excel_paths=(geometry_excel_paths or []),
     )
-    if src is not None:
-        print(f"  Midpoint XYZ loaded from: {src.relative_to(CWD.parent)}")
+    excel_has_profile = any(v is not None for v in (g_len, gx, gy, gz, s_mid))
+    if g_len is not None and g_len > 0.0:
+        line_length_m = float(g_len)
+    if gx is not None and gy is not None and gz is not None:
+        # Coordinate workbook is primary source for UTM + ortho height.
+        x_mid, y_mid, z_mid = float(gx), float(gy), float(gz)
+        src = gsrc
+    elif not excel_has_profile and seg2_mid_xyz is not None and len(seg2_mid_xyz) >= 3:
+        # Only if profile is missing in coordinate workbook, fallback to SEG2-derived coordinates.
+        sx, sy, sz = seg2_mid_xyz[0], seg2_mid_xyz[1], seg2_mid_xyz[2]
+        if sx is not None and sy is not None and sz is not None:
+            x_mid, y_mid, z_mid = float(sx), float(sy), float(sz)
+            src = "SEG2(mid-shot)"
+    if acq_dt_excel:
+        acq_dt_final = acq_dt_excel
+    elif len(recv_positions) >= 1:
+        station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
+        x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
+            profile_name,
+            station_mid=station_mid,
+            excel_paths=(geometry_excel_paths or []),
+        )
 
-    row = [
-        line_val,
-        round(length_m, 3),
+    if src is not None:
+        try:
+            src_rel = src.relative_to(CWD.parent)
+        except Exception:
+            src_rel = src
+        if s_min is not None and s_mid is not None and s_max is not None:
+            print(
+                f"  Geometry loaded from: {src_rel} | "
+                f"Stations {s_min:.1f}-{s_mid:.1f}-{s_max:.1f} | "
+                f"LineLength={line_length_m:.3f} m"
+            )
+        else:
+            print(f"  Midpoint XYZ loaded from: {src_rel}")
+
+    v0e_vals = [v for v in (float(_get_v(sid_l, "V0_m_s")), float(_get_v(sid_r, "V0_m_s"))) if v > 0.0]
+    v0e = float(np.mean(v0e_vals)) if v0e_vals else 0.0
+    v0c = float(_get_v(sid_m, "V0_m_s")) if sid_m is not None else 0.0
+
+    row_template = [
+        "",  # NUM assigned after target row selection
+        name_base,
+        sp_count,
+        f"{profile_len_shot_points_m:.1f} m",
         x_mid if x_mid is not None else "",
         y_mid if y_mid is not None else "",
         z_mid if z_mid is not None else "",
-        round(_get_v(sid_l, "V0_m_s"), 3),
-        round(_get_v(sid_m, "V0_m_s"), 3),
-        round(_get_v(sid_r, "V0_m_s"), 3),
+        round(v0e, 3),
+        round(v0c, 3),
         round(v0a, 3),
+        round(d1, 3),
+        round(v1a, 3),
+        round(t1, 3),
+        round(d2, 3),
+        round(v2a, 3),
+        round(t2, 3),
+        round(d1 + d2, 3),
+        round(profile_len_shot_points_m, 3),
+        round(line_length_m, 3),
+        round(float(s_mid), 3) if s_mid is not None else "",
+        acq_dt_final or "",
+        round(_get_v(sid_l, "V0_m_s"), 3),
+        round(_get_v(sid_r, "V0_m_s"), 3),
         round(_get_v(sid_l, "V1_m_s"), 3),
         round(_get_v(sid_m, "V1_m_s"), 3),
         round(_get_v(sid_r, "V1_m_s"), 3),
-        round(v1a, 3),
-        round(t1, 3),
-        round(d1, 3),
         round(_get_v(sid_l, "V2_m_s"), 3),
         round(_get_v(sid_m, "V2_m_s"), 3),
         round(_get_v(sid_r, "V2_m_s"), 3),
-        round(v2a, 3),
-        round(t2, 3),
-        round(d2, 3),
-        round(d1 + d2, 3),
     ]
-
-    profile_col = 1
+    name_col = 2
     legacy_line_val = cfg.get("line_no", None)
     row_base = None
     row_new = None
     row_legacy = None
     for rr in range(2, ws.max_row + 1):
-        val = ws.cell(row=rr, column=profile_col).value
+        val = ws.cell(row=rr, column=name_col).value
         val_s = str(val).strip()
-        if val_s == line_val:
+        if val_s == name_base:
             row_base = rr
-        elif val_s == line_new_val:
+        elif val_s == name_new:
             row_new = rr
         elif legacy_line_val is not None and val_s == str(legacy_line_val).strip():
             row_legacy = rr
 
+    def _next_num() -> int:
+        nums = []
+        for rr in range(2, ws.max_row + 1):
+            v = ws.cell(row=rr, column=1).value
+            try:
+                nums.append(int(float(str(v).strip())))
+            except Exception:
+                continue
+        return (max(nums) + 1) if nums else 1
+
     base_exists = (row_base is not None) or (row_legacy is not None)
     if base_exists:
         # Keep the original/base row intact; update/create the "_new" row.
-        row[0] = line_new_val
+        row = list(row_template)
+        row[1] = name_new
         target_row = row_new if row_new is not None else (ws.max_row + 1)
     else:
         # No base row yet: write/update canonical row by profile token.
-        row[0] = line_val
+        row = list(row_template)
+        row[1] = name_base
         target_row = row_base if row_base is not None else (ws.max_row + 1)
+
+    existing_num = ws.cell(row=target_row, column=1).value if target_row <= ws.max_row else None
+    try:
+        row[0] = int(float(str(existing_num).strip()))
+    except Exception:
+        row[0] = _next_num()
 
     for ci, vv in enumerate(row, start=1):
         ws.cell(row=target_row, column=ci, value=vv)
@@ -1255,7 +1476,12 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
                               perp_by_shot: dict | None = None,
                               inline_shift_by_shot: dict | None = None) -> dict:
     """
-    Build per-shot corrected pick rows with true offset and interpolated travel-time.
+    Build per-shot corrected pick rows with true offset and corrected travel-time.
+
+    Note
+    ----
+    Perpendicular/inline-shift corrections change the x-domain only. Pick times stay
+    on their measured (bulk-corrected) basis, so fitting uses consistent (x_true, t).
 
     Returns
     -------
@@ -1263,7 +1489,7 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
         {
           trace_idx, trace_no, recv_pos_m, shot_pos_m,
           inline_signed_m, inline_abs_m, perp_m, true_off_m,
-          fb_raw_ms, fb_bulk_ms, fb_interp_inline_ms, side
+                    fb_raw_ms, fb_bulk_ms, fb_interp_inline_ms, side
         }, ...
     ]}
     """
@@ -1306,28 +1532,6 @@ def build_corrected_pick_data(shots_info: list, all_picks: dict,
                 "fb_interp_geom_ms": float(bulk_picks.get(trace_idx, raw_picks[trace_idx])),
                 "side": side,
             })
-
-        for side in ("L", "R"):
-            part = [r for r in rows if r["side"] == side]
-            if len(part) < 2:
-                continue
-
-            part_sorted = sorted(part, key=lambda r: (r["inline_abs_m"], r["trace_idx"]))
-            x_true = np.array([r["true_off_m"] for r in part_sorted], dtype=float)
-            t_bulk = np.array([r["fb_bulk_ms"] for r in part_sorted], dtype=float)
-            x_inline = np.array([r["inline_corr_m"] for r in part_sorted], dtype=float)
-
-            if np.allclose(x_true, x_true[0]):
-                t_interp = t_bulk.copy()
-            else:
-                order = np.argsort(x_true)
-                xs = x_true[order]
-                ts = t_bulk[order]
-                t_interp = np.interp(x_inline, xs, ts)
-
-            for rr, ti in zip(part_sorted, t_interp):
-                rr["fb_interp_inline_ms"] = float(ti)
-                rr["fb_interp_geom_ms"] = float(ti)
 
         corrected[int(shot_id)] = sorted(rows, key=lambda r: r["trace_idx"])
 
@@ -1484,6 +1688,107 @@ def read_seg2(path: Path) -> tuple:
         ffid   = int(digits) if digits else 0
 
     return data, dt_s, n_traces, n_samp, shot_pos, ffid, delay_ms, recv_locs_m
+
+
+def read_seg2_acquisition_time_de(path: Path,
+                                  tz_name: str = "Europe/Berlin") -> str | None:
+    """Return acquisition datetime formatted in German timezone from SEG2 metadata."""
+    import warnings
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            st = _read_obspy(str(path), format="SEG2")
+    except Exception:
+        return None
+    if not st:
+        return None
+
+    dt_utc = None
+    try:
+        dt0 = st[0].stats.starttime.datetime
+        if dt0.tzinfo is None:
+            dt_utc = dt0.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt_utc = dt0.astimezone(datetime.timezone.utc)
+    except Exception:
+        dt_utc = None
+
+    if dt_utc is None:
+        try:
+            hdr0 = dict(st[0].stats.seg2)
+        except Exception:
+            hdr0 = {}
+        d_raw = str(hdr0.get("ACQUISITION_DATE", "")).strip()
+        t_raw = str(hdr0.get("ACQUISITION_TIME", "")).strip()
+        if d_raw and t_raw:
+            for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S"):
+                try:
+                    dt_naive = datetime.datetime.strptime(f"{d_raw} {t_raw}", fmt)
+                    dt_utc = dt_naive.replace(tzinfo=datetime.timezone.utc)
+                    break
+                except Exception:
+                    continue
+
+    if dt_utc is None:
+        return None
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = datetime.timezone(datetime.timedelta(hours=1), name="CET")
+    dt_local = dt_utc.astimezone(tz)
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def read_seg2_mid_xyz(path: Path) -> tuple:
+    """Try extracting (X,Y,Z) from SEG2 headers; return (None,None,None) if unavailable."""
+    import warnings
+
+    def _to_float(v: Any) -> float | None:
+        try:
+            s = str(v).strip().replace(",", ".")
+            if not s:
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            st = _read_obspy(str(path), format="SEG2")
+    except Exception:
+        return None, None, None
+    if not st:
+        return None, None, None
+
+    try:
+        h = dict(st[0].stats.seg2)
+    except Exception:
+        h = {}
+
+    key_x = next((k for k in h.keys() if str(k).upper() in ("X", "X_UTM", "EASTING", "UTM_X")), None)
+    key_y = next((k for k in h.keys() if str(k).upper() in ("Y", "Y_UTM", "NORTHING", "UTM_Y")), None)
+    key_z = next((k for k in h.keys() if str(k).upper() in ("Z", "ELEV", "ELEVATION", "HEIGHT", "UTM_Z")), None)
+    if key_x and key_y and key_z:
+        xv = _to_float(h.get(key_x))
+        yv = _to_float(h.get(key_y))
+        zv = _to_float(h.get(key_z))
+        if xv is not None and yv is not None and zv is not None:
+            return xv, yv, zv
+
+    src_loc = str(h.get("SOURCE_LOCATION", "")).strip().replace(",", ".")
+    if src_loc:
+        parts = src_loc.split()
+        if len(parts) >= 3:
+            xv = _to_float(parts[0])
+            yv = _to_float(parts[1])
+            zv = _to_float(parts[2])
+            if xv is not None and yv is not None and zv is not None:
+                return xv, yv, zv
+
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -3160,6 +3465,8 @@ class FirstBreakPicker:
         qc_dir: Path | None = None,
         save_callback: Any = None,
         header_info: dict | None = None,
+        control_file: Path | None = None,
+        show_plot_controls: bool = True,
     ):
         self.data_raw = data_raw
         self.data_filt = data_filt
@@ -3185,6 +3492,9 @@ class FirstBreakPicker:
         self.ax_top: Any = None
         self._save_callback = save_callback
         self._header_info = header_info or {}
+        self._control_file = Path(control_file) if control_file else None
+        self._last_control_id = 0
+        self._show_plot_controls = bool(show_plot_controls)
         self._nav_action = "stay"
         self._drag_pick = False
         self._drag_delete = False
@@ -3249,7 +3559,10 @@ class FirstBreakPicker:
     def _build_figure(self):
         c = _tc()
         self.fig, self.ax = plt.subplots(figsize=(16, 8), constrained_layout=False)
-        self.fig.subplots_adjust(left=0.06, right=0.76, bottom=0.13, top=0.91)
+        if self._show_plot_controls:
+            self.fig.subplots_adjust(left=0.06, right=0.76, bottom=0.13, top=0.91)
+        else:
+            self.fig.subplots_adjust(left=0.06, right=0.98, bottom=0.13, top=0.91)
         self.fig.patch.set_facecolor(c["fig_bg"])
         self.ax.set_facecolor(c["ax_bg"])
         try:
@@ -3265,7 +3578,8 @@ class FirstBreakPicker:
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-        self._build_controls()
+        if self._show_plot_controls:
+            self._build_controls()
         self._redraw()
 
     def _build_controls(self):
@@ -4403,6 +4717,77 @@ class FirstBreakPicker:
         self.fig.savefig(str(out), dpi=180, bbox_inches=bbox_inches, facecolor=self.ax.get_facecolor())
         print(f"\n     QC image -> {out.name}")
 
+    def _poll_external_control(self):
+        self._last_control_id, payload = read_latest_picker_command(self._control_file, self._last_control_id)
+        if payload is None:
+            return
+
+        action = str(payload.get("action", "")).strip().lower()
+        try:
+            if action == "prev":
+                self._go_prev()
+                return
+            if action == "next":
+                self._save_and_finish("next")
+                return
+            if action == "finalize":
+                self._save_and_finish("finalize")
+                return
+            if action == "quit":
+                self._cancelled = True
+                self._nav_action = "quit"
+                self._done = True
+                try:
+                    self.fig.canvas.stop_event_loop()
+                except Exception:
+                    pass
+                return
+            if action == "auto":
+                self._auto_then_redraw()
+                return
+            if action == "invert":
+                self._toggle_invert()
+                return
+            if action == "timeline":
+                self._toggle_timelines()
+                return
+            if action == "filter_toggle":
+                self._filter_mode = {"none": "butter", "butter": "ormsby", "ormsby": "cutpass", "cutpass": "none"}.get(self._filter_mode, "none")
+                self._refresh_mode_buttons()
+                self._redraw()
+                return
+            if action == "save_image":
+                self._save_qc_image()
+                return
+            if action == "gain":
+                self._on_gain_mode(str(payload.get("value", "norm")))
+                return
+            if action == "agc_stat":
+                self._on_agc_stat(str(payload.get("value", "rms")))
+                return
+            if action == "display":
+                self._on_display_mode(str(payload.get("value", "both")))
+                return
+            if action == "agc_window":
+                self._on_agc_window(float(payload.get("value", self._agc_window_ms)))
+                self._redraw()
+                return
+            if action == "wiggle_scale":
+                self._on_wiggle_stretch(float(payload.get("value", self._wiggle_stretch)))
+                self._redraw()
+                return
+            if action == "set_filter":
+                f1 = float(payload.get("f1", self._f1))
+                f2 = float(payload.get("f2", self._f2))
+                f3 = float(payload.get("f3", self._f3))
+                f4 = float(payload.get("f4", self._f4))
+                if f1 < f2 < f3 < f4:
+                    self._f1, self._f2, self._f3, self._f4 = f1, f2, f3, f4
+                    self._schedule_filter_update()
+                return
+        except Exception as exc:
+            print(f"     [WARN] control command failed: {action} ({exc})")
+
     def run(self) -> Any:
         self._done = False
 
@@ -4420,6 +4805,7 @@ class FirstBreakPicker:
 
         while not self._done:
             try:
+                self._poll_external_control()
                 self.fig.canvas.start_event_loop(0.05)
             except Exception:
                 self._cancelled = True
@@ -5186,7 +5572,9 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                     perp_by_shot_override: dict | None = None,
                     inline_shift_by_shot_override: dict | None = None,
                     perp_excel_cfg: dict | None = None,
-                    enable_layer_pick: bool = True):
+                    enable_layer_pick: bool = True,
+                    control_file: Path | None = None,
+                    show_plot_controls: bool = True):
     """
     Run the full profile pipeline: pick, correct, analyze, and export.
 
@@ -5254,9 +5642,27 @@ def process_profile(profile_name: str, pick_mode: bool = True,
 
     geom_from_seg2, seg2_len_m = infer_geometry_from_seg2_file(seg2_files[0])
 
+    geom_from_excel = None
+    excel_len_m = None
+    geometry_paths = [Path(p) for p in (perp_excel_cfg or {}).get("geometry_paths", []) if p]
+    if geometry_paths:
+        g_len, _gx, _gy, _gz, _gsrc, _smin, _smid, _smax, _acq_dt_de = load_profile_geometry_from_excels(
+            profile_name=profile_name,
+            excel_paths=geometry_paths,
+        )
+        if g_len is not None and g_len > 0.0:
+            excel_len_m = float(g_len)
+            geom_from_excel = infer_geometry_from_spread_length(excel_len_m)
+
     if geom_override is not None:
         geom_type = int(geom_override)
         geom_src = "CLI"
+    elif geom_from_excel in (100, 200):
+        geom_type = int(geom_from_excel)
+        geom_src = f"LVL geometry excel ({excel_len_m:.2f} m)"
+    elif int(cfg.get("geom", 200) or 200) in (100, 200):
+        geom_type = int(cfg.get("geom", 200) or 200)
+        geom_src = "profile config"
     elif geom_from_seg2 in (100, 200):
         geom_type = int(geom_from_seg2)
         geom_src = f"SEG2 spread-length ({seg2_len_m:.2f} m)"
@@ -5397,6 +5803,8 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                     "n_samp": n_samp,
                     "shot_pos_hdr": shot_pos_hdr,
                 },
+                control_file=control_file,
+                show_plot_controls=show_plot_controls,
             )
             result = picker.run() or {"status": "quit", "picks": all_picks.get(shot_id, {})}
             status = result.get("status", "next")
@@ -5427,6 +5835,16 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                 break
 
         idx += 1
+
+    acquisition_time_de = None
+    seg2_mid_xyz = (None, None, None)
+    if shot_cache:
+        mid_shot = shot_cache[len(shot_cache) // 2]
+        mid_seg2 = Path(mid_shot.get("seg2_path"))
+        acquisition_time_de = read_seg2_acquisition_time_de(mid_seg2)
+        seg2_mid_xyz = read_seg2_mid_xyz(mid_seg2)
+        if acquisition_time_de:
+            print(f"  Acquisition time (middle shot, DE): {acquisition_time_de}")
 
     preview_only = bool(pick_mode and not finalized)
     if preview_only:
@@ -5561,6 +5979,8 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         analysis=analysis,
         output_dir=OUTPUT_DIR,
         geometry_excel_paths=geometry_excels,
+        acquisition_time_de=acquisition_time_de,
+        seg2_mid_xyz=seg2_mid_xyz,
     )
     save_picks_json(profile_name, all_picks)
     save_layer_json(profile_name, layer_results)
@@ -6045,6 +6465,14 @@ def main():
                         help="Excel column for profile token, e.g. LVL150 (default: F)")
     parser.add_argument("--perp-col-inline-shift", default=None,
                         help="Optional Excel column for inline X-shift in meters")
+    parser.add_argument("--coord-excel", action="append", default=None,
+                        help="Optional LVL coordinate workbook path (can be passed multiple times)")
+    parser.add_argument("--device-type", default="sw_maps", choices=["sw_maps", "geomax"],
+                        help="Device/source type hint for loaders (default: sw_maps)")
+    parser.add_argument("--control-file", default=None,
+                        help="Path to JSON command file for external GUI live control")
+    parser.add_argument("--minimal-plot-controls", action="store_true",
+                        help="Hide in-plot buttons/widgets and use external GUI controls")
     parser.add_argument("--no-layer-pick", action="store_true",
                         help="Skip interactive x0..x5 layer-window picking")
     args = parser.parse_args()
@@ -6096,11 +6524,21 @@ def main():
                     print(f"    - {p}")
 
     geometry_paths: list = []
+    if args.coord_excel:
+        for cp in args.coord_excel:
+            try:
+                geometry_paths.append(str(Path(cp)))
+            except Exception:
+                pass
     for p in DATA_DIR.glob("LVL*.xls*"):
         name = p.name.lower()
         if "field_report" in name or "fieldreport" in name:
             continue
-        geometry_paths.append(str(p))
+        sp = str(p)
+        if sp not in geometry_paths:
+            geometry_paths.append(sp)
+
+    print(f"  Device type: {args.device_type}")
 
     perp_excel_cfg = {
         "paths": report_paths,
@@ -6110,6 +6548,7 @@ def main():
         "profile_col": args.perp_col_profile,
         "inline_shift_col": args.perp_col_inline_shift,
         "geometry_paths": geometry_paths,
+        "device_type": args.device_type,
     }
 
     if args.all:
@@ -6163,7 +6602,9 @@ def main():
                         perp_by_shot_override=perp_override,
                         inline_shift_by_shot_override=inline_shift_override,
                         perp_excel_cfg=perp_excel_cfg,
-                        enable_layer_pick=not args.no_layer_pick)
+                        enable_layer_pick=not args.no_layer_pick,
+                        control_file=(Path(args.control_file) if args.control_file else None),
+                        show_plot_controls=not args.minimal_plot_controls)
 
     print("\nAll done.")
 
