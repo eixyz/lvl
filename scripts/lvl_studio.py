@@ -149,7 +149,7 @@ class SeismicDisplay(QtWidgets.QWidget):
         x_positions: np.ndarray,
         x_label: str,
         shot_x: float | None = None,
-        picks: dict[int, float] | None = None,
+        layers: list[tuple[str, str, dict[int, float], bool]] | None = None,
     ):
         self._current_shot = shot
         self.ax.clear()
@@ -259,15 +259,32 @@ class SeismicDisplay(QtWidgets.QWidget):
                     zorder=2,
                 )
 
-        if picks:
-            xs: list[float] = []
-            ys: list[float] = []
+        legend_handles = []
+        for name, color, layer_picks, is_active in (layers or []):
+            if not layer_picks:
+                continue
+            xs2: list[float] = []
+            ys2: list[float] = []
             for view_idx, tr_idx in enumerate(self.last_view_to_trace):
-                if tr_idx in picks:
-                    xs.append(float(xv[view_idx]))
-                    ys.append(float(picks[tr_idx]))
-            if xs:
-                self.ax.plot(xs, ys, color="#d7191c", linewidth=1.2, marker="o", markersize=3, zorder=6)
+                if tr_idx in layer_picks:
+                    xs2.append(float(xv[view_idx]))
+                    ys2.append(float(layer_picks[tr_idx]))
+            if not xs2:
+                continue
+            lw = 1.4 if is_active else 1.0
+            msz = 3.2 if is_active else 2.4
+            alpha = 1.0 if is_active else 0.85
+            zorder = 7 if is_active else 6
+            label = f"{name} (active)" if is_active else name
+            (line,) = self.ax.plot(
+                xs2, ys2, color=color, linewidth=lw, marker="o", markersize=msz,
+                alpha=alpha, zorder=zorder, label=label,
+            )
+            legend_handles.append(line)
+        if len(legend_handles) > 1:
+            leg = self.ax.legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.85)
+            for txt in leg.get_texts():
+                txt.set_color(tick_col)
 
         self.ax.set_title(
             f"{shot.shot_label} | FFID {shot.ffid} | traces {shot.n_traces} (view {data_view.shape[0]}) | samples {shot.n_samples}",
@@ -299,7 +316,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         self.settings = StudioSettings()
         self.shots: list[ShotGather] = []
-        self.picks_by_shot: dict[int, dict[int, float]] = {}
+        # Multi-layer picks: "Mine" is the default, always-active editable layer.
+        # Imported layers are overlaid read-only until made active.
+        self.pick_layers: dict[str, dict[int, dict[int, float]]] = {"Mine": {}}
+        self.layer_colors: dict[str, str] = {"Mine": "#d7191c"}
+        self.layer_visible: dict[str, bool] = {"Mine": True}
+        self.active_layer: str = "Mine"
+        self._layer_color_cycle = ["#1f78b4", "#33a02c", "#ff7f00", "#6a3d9a", "#b15928", "#a6cee3", "#e31a1c", "#008080"]
         self.current_idx = -1
         self.pick_enabled = True
         self._drag_pick = False
@@ -318,6 +341,23 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._build_actions()
         self._build_shortcuts()
+
+    @property
+    def picks_by_shot(self) -> dict[int, dict[int, float]]:
+        """Picks of the currently active layer (kept as a property so all
+        existing pick-editing code transparently operates on the active layer)."""
+        return self.pick_layers.setdefault(self.active_layer, {})
+
+    @picks_by_shot.setter
+    def picks_by_shot(self, value: dict[int, dict[int, float]]):
+        self.pick_layers[self.active_layer] = value
+
+    def _reset_pick_layers(self):
+        self.pick_layers = {"Mine": {}}
+        self.layer_colors = {"Mine": "#d7191c"}
+        self.layer_visible = {"Mine": True}
+        self.active_layer = "Mine"
+        self._refresh_layers_list()
 
     def _build_ui(self):
         self.display = SeismicDisplay(self)
@@ -465,6 +505,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.cmb_geom_view.addItems(["auto", "100", "200", "custom"])
         self.cmb_geom_view.setCurrentText(self.settings.geometry_override)
 
+        self.layers_list = QtWidgets.QListWidget(self)
+        self.layers_list.setToolTip("Checked = visible on plot. Select a layer and click 'Set Active' to edit it.")
+        self.btn_import_layer = QtWidgets.QPushButton("Import Picks File...")
+        self.btn_set_active_layer = QtWidgets.QPushButton("Set Active Layer")
+        self.btn_remove_layer = QtWidgets.QPushButton("Remove Layer")
+        self.lbl_active_layer = QtWidgets.QLabel("Active layer: Mine")
+
         controls = QtWidgets.QToolBox(self)
 
         page_nav = QtWidgets.QWidget(self)
@@ -528,9 +575,19 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         cmp_form.addRow(self.btn_run_analysis)
         cmp_form.addRow(self.btn_run_compute)
 
+        page_layers = QtWidgets.QWidget(self)
+        layers_v = QtWidgets.QVBoxLayout(page_layers)
+        layers_v.setContentsMargins(6, 6, 6, 6)
+        layers_v.addWidget(self.lbl_active_layer)
+        layers_v.addWidget(self.layers_list)
+        layers_v.addWidget(self.btn_import_layer)
+        layers_v.addWidget(self.btn_set_active_layer)
+        layers_v.addWidget(self.btn_remove_layer)
+
         controls.addItem(page_nav, "Navigation")
         controls.addItem(page_disp, "Display")
         controls.addItem(page_proc, "Processing")
+        controls.addItem(page_layers, "Pick Layers")
         controls.addItem(page_pick, "Picking")
         controls.addItem(page_compute, "Compute")
 
@@ -587,6 +644,10 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_run_compute.clicked.connect(self._run_full_computation)
         self.btn_run_analysis.clicked.connect(self._run_interactive_analysis)
         self.btn_save_excel.clicked.connect(self._save_excel_summary)
+        self.btn_import_layer.clicked.connect(self._import_pick_layer)
+        self.btn_set_active_layer.clicked.connect(self._set_active_layer_from_selection)
+        self.btn_remove_layer.clicked.connect(self._remove_selected_layer)
+        self.layers_list.itemChanged.connect(self._on_layer_item_changed)
         self.shot_list.currentRowChanged.connect(self.set_shot)
         self.spin_clip.valueChanged.connect(self._on_view_settings_changed)
         self.spin_max_tr.valueChanged.connect(self._on_view_settings_changed)
@@ -631,6 +692,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         act_open = QAction("Open SEG2 Folder", self)
         act_open.triggered.connect(self.open_folder)
         menu_file.addAction(act_open)
+
+        menu_file.addSeparator()
+        act_exit = QAction("Exit", self)
+        act_exit.setShortcut("Ctrl+Q")
+        act_exit.triggered.connect(self.close)
+        menu_file.addAction(act_exit)
 
         menu_view = self.menuBar().addMenu("View")
 
@@ -1196,6 +1263,184 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def _shot_pick_map(self, idx: int) -> dict[int, float]:
         return self.picks_by_shot.setdefault(int(idx), {})
 
+    # ------------------------------------------------------------------
+    # Multi-layer pick management (own picks + imported reference picks)
+    # ------------------------------------------------------------------
+
+    def _next_layer_color(self) -> str:
+        used = set(self.layer_colors.values())
+        for c in self._layer_color_cycle:
+            if c not in used:
+                return c
+        return self._layer_color_cycle[len(self.layer_colors) % len(self._layer_color_cycle)]
+
+    def _refresh_layers_list(self):
+        self.layers_list.blockSignals(True)
+        self.layers_list.clear()
+        for name in self.pick_layers:
+            item = QtWidgets.QListWidgetItem(name)
+            color = self.layer_colors.get(name, "#888888")
+            pix = QtGui.QPixmap(12, 12)
+            pix.fill(QtGui.QColor(color))
+            item.setIcon(QtGui.QIcon(pix))
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                          if hasattr(QtCore.Qt, "ItemFlag") else item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            checked = self.layer_visible.get(name, True)
+            check_state = getattr(QtCore.Qt, "CheckState", None)
+            item.setCheckState(
+                (check_state.Checked if checked else check_state.Unchecked)
+                if check_state is not None
+                else (QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            )
+            if name == self.active_layer:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setText(f"{name}  [active]")
+            self.layers_list.addItem(item)
+        self.layers_list.blockSignals(False)
+        self.lbl_active_layer.setText(f"Active layer: {self.active_layer}")
+
+    def _selected_layer_name(self) -> str | None:
+        item = self.layers_list.currentItem()
+        if item is None:
+            return None
+        return str(item.text()).replace("  [active]", "").strip()
+
+    def _on_layer_item_changed(self, item: Any):
+        name = str(item.text()).replace("  [active]", "").strip()
+        check_state = getattr(QtCore.Qt, "CheckState", None)
+        checked_val = check_state.Checked if check_state is not None else QtCore.Qt.Checked
+        self.layer_visible[name] = (item.checkState() == checked_val)
+        self._render_current()
+
+    def _set_active_layer_from_selection(self):
+        name = self._selected_layer_name()
+        if not name or name not in self.pick_layers:
+            QtWidgets.QMessageBox.information(self, "Pick Layers", "Select a layer in the list first.")
+            return
+        self.active_layer = name
+        self.layer_visible[name] = True
+        self._refresh_layers_list()
+        self._render_current()
+        self.statusBar().showMessage(f"Active layer set to '{name}'. Editing/auto-pick/analysis now use this layer.")
+
+    def _remove_selected_layer(self):
+        name = self._selected_layer_name()
+        if not name or name not in self.pick_layers:
+            return
+        if name == "Mine":
+            QtWidgets.QMessageBox.information(self, "Pick Layers", "The default 'Mine' layer cannot be removed.")
+            return
+        del self.pick_layers[name]
+        self.layer_colors.pop(name, None)
+        self.layer_visible.pop(name, None)
+        if self.active_layer == name:
+            self.active_layer = "Mine"
+        self._refresh_layers_list()
+        self._render_current()
+
+    def _import_pick_layer(self):
+        if not self.shots:
+            QtWidgets.QMessageBox.information(self, "Import Picks", "Open a SEG2 folder first.")
+            return
+        start_dir = str(self._current_folder or DATA_DIR if DATA_DIR.exists() else Path.cwd())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import picks file", start_dir,
+            "Picks (*.txt *.json);;Text picks (*.txt);;JSON picks (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            p = Path(path)
+            if p.suffix.lower() == ".json":
+                layer_data = self._parse_json_picks_file(p)
+            else:
+                layer_data = self._parse_txt_picks_file(p)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Import Picks Error", str(exc))
+            return
+
+        n_shots_with_picks = sum(1 for v in layer_data.values() if v)
+        if n_shots_with_picks == 0:
+            QtWidgets.QMessageBox.warning(self, "Import Picks", "No usable picks found in this file.")
+            return
+
+        base_name = Path(path).stem
+        name = base_name
+        suffix = 2
+        while name in self.pick_layers:
+            name = f"{base_name} ({suffix})"
+            suffix += 1
+
+        self.pick_layers[name] = layer_data
+        self.layer_colors[name] = self._next_layer_color()
+        self.layer_visible[name] = True
+        self._refresh_layers_list()
+        self._render_current()
+        self.statusBar().showMessage(
+            f"Imported layer '{name}' from {Path(path).name} ({n_shots_with_picks} shot(s) with picks). "
+            "Use 'Set Active Layer' to edit/use it for computation."
+        )
+
+    def _parse_txt_picks_file(self, path: Path) -> dict[int, dict[int, float]]:
+        """Parse Ensemble/#/SOURCE/CHAN/OFFSET/FB_PICK text (as exported by lvl_refraction.py)."""
+        out: dict[int, dict[int, float]] = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                parts = s.replace(",", ".").split()
+                if not parts or not parts[0].lstrip("-").isdigit():
+                    continue  # header or non-data line
+                if len(parts) < 6:
+                    continue
+                try:
+                    source = int(float(parts[2]))
+                    chan = int(float(parts[3]))
+                    fb_pick = float(parts[5])
+                except Exception:
+                    continue
+                shot_idx = source - 1
+                trace_idx = chan - 1
+                out.setdefault(shot_idx, {})[trace_idx] = fb_pick
+        return out
+
+    def _parse_json_picks_file(self, path: Path) -> dict[int, dict[int, float]]:
+        """Parse picks.json/picks.session.json-style ({shot_id: {trace_idx: ms}})
+        or the studio's own Save Picks JSON export format."""
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        out: dict[int, dict[int, float]] = {}
+        if isinstance(raw, dict) and "shots" in raw and isinstance(raw["shots"], list):
+            for entry in raw["shots"]:
+                idx = int(entry.get("index", 0))
+                tr_map = entry.get("picks_ms_by_trace_index", {}) or {}
+                d: dict[int, float] = {}
+                for k, v in tr_map.items():
+                    try:
+                        d[int(k) - 1] = float(v)
+                    except Exception:
+                        continue
+                if d:
+                    out[idx] = d
+            return out
+        for sid_str, tr_map in (raw or {}).items():
+            try:
+                idx = int(sid_str) - 1
+            except Exception:
+                continue
+            d = {}
+            for ti_str, tv in (tr_map or {}).items():
+                try:
+                    d[int(ti_str)] = float(tv)
+                except Exception:
+                    continue
+            if d:
+                out[idx] = d
+        return out
+
     def _pick_trace_from_event(self, event: Any) -> tuple[int, float] | None:
         if not self.pick_enabled:
             return None
@@ -1483,7 +1728,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Load Error", str(exc))
             return
 
-        self.picks_by_shot = {}
+        self._reset_pick_layers()
         self.shot_list.clear()
         for s in self.shots:
             self.shot_list.addItem(
@@ -1922,6 +2167,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         data_proc = self._processed_trace_matrix(shot)
         t0 = self._time_zero_ms(shot)
         picks = self.picks_by_shot.get(self.current_idx, {})
+        layers = [
+            (name, self.layer_colors.get(name, "#888888"), layer_picks.get(self.current_idx, {}), name == self.active_layer)
+            for name, layer_picks in self.pick_layers.items()
+            if self.layer_visible.get(name, True)
+        ]
         self.display.draw_shot(
             shot,
             self.settings,
@@ -1930,7 +2180,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             x_positions=x_axis,
             x_label=x_label,
             shot_x=shot_x,
-            picks=picks,
+            layers=layers,
         )
         # Preserve an active scroll-zoom across re-renders (e.g. after each pick).
         if self._view_xlim is not None and self._view_ylim is not None:

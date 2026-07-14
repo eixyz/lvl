@@ -110,18 +110,37 @@ True offset:
 XO = sqrt(Xcorr^2 + PO^2)
 ```
 
+$$
+X_O=\sqrt{X_{\mathrm{corr}}^{\,2}+PO^2}
+$$
+
 Velocity from fitted slope m (ms/m):
 
 ```text
 V = 1000 / m
 ```
 
+$$
+V=\frac{1000}{m}
+$$
 Two-layer depth:
 
 ```text
 H0 = (ti1/1000) * V0 * V1 / (2 * sqrt(V1^2 - V0^2))
 ```
 
+$$
+H_0=
+\frac{\left(\dfrac{TI_1}{1000}\right)V_0V_1}
+{2\sqrt{V_1^2-V_0^2}}
+$$
+
+Or more compactly
+$$
+H_0=
+\frac{TI_1\,V_0V_1}
+{2000\sqrt{V_1^2-V_0^2}}
+$$
 Three-layer second depth (spreadsheet-compatible form):
 
 ```text
@@ -129,11 +148,39 @@ TI2_eff = TI2 - 2 * H0 * cos(arcsin(V0/V2)) / V0 * 1000
 H1      = V1 * TI2_eff / (2000 * cos(arcsin(V1/V2)))
 ```
 
+$$
+TI_{2,\mathrm{eff}}
+=
+TI_2
+-
+\frac{2H_0
+\cos\!\left(
+\arcsin\!\left(\frac{V_0}{V_2}\right)
+\right)}
+{V_0}
+\cdot1000
+$$
+
+Effective intercept time (TI2,eff). The measured intercept time TI2 for the second refractor includes the travel-time delay introduced by the overlying low-velocity layer. This contribution is removed to obtain an effective intercept time, TI2,eff, which is then used in the standard two-layer intercept-time equation to compute the thickness of the intermediate layer. The denominator 2000=2×1000 combines the two-way travel path through the overlying layer (factor 2) with the conversion from milliseconds to seconds (factor 1000). This explanation matches the physical interpretation of the intercept-time method and makes the derivation much easier to follow.
+
+$$
+H_1=
+\frac{V_1\,TI_{2,\mathrm{eff}}}
+{2000
+\cos\!\left(
+\arcsin\!\left(\frac{V_1}{V_2}\right)
+\right)}
+$$
+
 Refractor depth:
 
 ```text
 DR = H0 + H1
 ```
+
+$$
+DR=H_0+H_1
+$$
 
 Why 2000 appears:
 
@@ -176,11 +223,18 @@ Signed inline offset:
 DX_k = x_k - SP
 ```
 
+$$
+DX_k=x_k-SP
+$$
 Absolute inline offset:
 
 ```text
 X_inline_k = abs(DX_k)
 ```
+
+$$
+X_{\mathrm{inline},k}=|DX_k|
+$$
 
 Optional inline shift:
 
@@ -188,11 +242,29 @@ Optional inline shift:
 X_corr_k = max(0, X_inline_k + dX)
 ```
 
+$$
+X_{\mathrm{corr},k}
+=
+\max\!\left(0,\,
+X_{\mathrm{inline},k}+dX
+\right)
+$$
+
 True offset with perpendicular distance PO:
 
 ```text
 XO_k = sqrt(X_corr_k^2 + PO^2)
 ```
+
+$$
+X_{O,k}
+=
+\sqrt{
+X_{\mathrm{corr},k}^{\,2}
++
+PO^2
+}
+$$
 
 Fitting is based on true offset XO.
 
@@ -204,11 +276,37 @@ Sample time axis (ms):
 t_n = delay_ms + n * dt_s * 1000
 ```
 
+$$
+t_n
+=
+t_{\mathrm{delay}}
++
+n\,\Delta t
+$$
+
+Or
+
+$$
+t_n
+=
+\mathrm{delay}_{ms}
++
+n\,dt_s\cdot1000
+$$
+
 Bulk static correction for analysis/export:
 
 ```text
 t_bulk = t_raw + t_static
 ```
+
+$$
+t_{\mathrm{bulk}}
+=
+t_{\mathrm{raw}}
++
+t_{\mathrm{static}}
+$$
 
 ## 10) Piecewise T-X Fitting
 
@@ -218,17 +316,42 @@ Each picked layer window is fitted as:
 t(X) = mX + b
 ```
 
+$$
+t(X)=mX+b
+$$
+
 Velocity from slope m (ms/m):
 
 ```text
 V = 1000 / m
 ```
 
+$$
+V=\frac{1000}{m}
+$$
+
 R-squared:
 
 ```text
 R2 = 1 - sum((t_i - t_hat_i)^2) / sum((t_i - t_mean)^2)
 ```
+
+$$
+R^2
+=
+1-
+\frac{
+\sum_i
+\left(
+t_i-\hat t_i
+\right)^2
+}{
+\sum_i
+\left(
+t_i-\bar t
+\right)^2
+}
+$$
 
 ## 11) RMS Quality Metric
 
@@ -237,6 +360,20 @@ RMS_ms = sqrt(mean((t_obs - t_calc)^2))
 ```text
 RMS_ms = sqrt(mean((t_obs - t_calc)^2))
 ```
+
+$$
+RMS_{ms}
+=
+\sqrt{
+\frac{1}{N}
+\sum_{i=1}^{N}
+\left(
+t_{\mathrm{obs},i}
+-
+t_{\mathrm{calc},i}
+\right)^2
+}
+$$
 
 This is used in fit-review and diagnostics exports.
 

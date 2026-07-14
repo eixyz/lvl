@@ -2183,8 +2183,8 @@ def depth_3layer(ti2_ms: float, V1: float, V2: float,
     cos_i23 = math.sqrt(max(0.0, 1.0 - (V2 / V3) ** 2))
     if cos_i23 <= 0.0:
         return None
-    delay_ms = 2.0 * h1 * cos_i13 / V1 * 1000.0
-    ti2_eff = ti2_ms - delay_ms
+    layer1_delay_ms = 2.0 * h1 * cos_i13 / V1 * 1000.0
+    ti2_eff = ti2_ms - layer1_delay_ms
     if ti2_eff <= 0.0:
         return None
     return (V2 * ti2_eff) / (2000.0 * cos_i23)
