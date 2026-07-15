@@ -4,7 +4,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from lvl_modules.app_paths import REFRACTION_SCRIPT
+from lvl.sandbox.scripts.lvl_modules.app_paths import REFRACTION_SCRIPT
 
 
 @dataclass

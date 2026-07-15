@@ -77,7 +77,7 @@ from tkinter import filedialog
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
-from lvl_modules.control_bridge import read_latest_picker_command
+from lvl.sandbox.scripts.lvl_modules.control_bridge import read_latest_picker_command
 
 # ---------------------------------------------------------------------------
 # Auto-install missing packages into the active environment

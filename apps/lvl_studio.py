@@ -63,7 +63,7 @@ def _dock_features(*feature_names: str) -> Any:
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "results"
 
 
 @dataclass
