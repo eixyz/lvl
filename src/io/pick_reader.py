@@ -4,20 +4,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.common.paths import OUTPUT_DIR, PROJECT_DIR
+from src.common.paths import (
+    PROJECT_DIR,
+    PICKS_DIR,
+    SESSIONS_DIR,
+    REPORTS_DIR,
+)
 
 
 def _picks_json_path(profile_name: str) -> Path:
-    return OUTPUT_DIR / profile_name / "picks.json"
+    return PICKS_DIR / profile_name / "picks.json"
 
 def _session_picks_json_path(profile_name: str) -> Path:
-    return OUTPUT_DIR / profile_name / "picks.session.json"
+    return SESSIONS_DIR / profile_name / "picks.session.json"
 
 def _layer_json_path(profile_name: str) -> Path:
-    return OUTPUT_DIR / profile_name / "layer_analysis.json"
+    return REPORTS_DIR / profile_name / "layer_analysis.json"
 
 def _layer_session_json_path(profile_name: str) -> Path:
-    return OUTPUT_DIR / profile_name / "layer_analysis.session.json"
+    return SESSIONS_DIR / profile_name / "layer_analysis.session.json"
 
 def _coerce_layer_results(raw: dict) -> dict:
     """Normalize JSON-loaded layer results into int-shot keyed dict form."""

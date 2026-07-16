@@ -17,7 +17,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 import matplotlib.pyplot as plt
 
-from src.common.paths import PROJECT_DIR, OUTPUT_DIR
+from src.common.paths import PROJECT_DIR, PICKS_DIR, PLOTS_DIR
 from src.common.settings import (
     T_MAX_MS, theme_colors, _ensure_interactive_backend,
     BP_F1, BP_F2, BP_F3, BP_F4, BP_FFT_PAD, BULK_SHIFT_MS,
@@ -297,7 +297,7 @@ def export_excel(profile_name: str, shots_info: list,
     Analysis  Python-computed velocities, intercept times, depths (green),
               R^2, RMS.  Depth formula reference below the table.
     """
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PICKS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     xl_path = out_dir / f"{profile_name}_picks{filename_suffix}.xlsx"
     wb      = openpyxl.Workbook()
@@ -632,7 +632,7 @@ def export_excel(profile_name: str, shots_info: list,
 def export_picks_txt(profile_name: str, shots_info: list,
                      all_picks: dict, recv_positions: Any) -> Path:
     """Write Ensemble / SOURCE / CHAN / OFFSET / FB_PICK text file."""
-    out_dir  = OUTPUT_DIR / profile_name
+    out_dir  = PICKS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     txt_path = out_dir / f"{profile_name}_picks_clean.txt"
     header   = (f"{'Ensemble':>10} {'#':>4} {'SOURCE':>8} "
@@ -817,7 +817,7 @@ def export_tx_plot(profile_name: str, shots_info: list,
                  color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.12)
 
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PLOTS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{profile_name}_tx_picks.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight",
@@ -911,7 +911,7 @@ def export_fit_plot(profile_name: str,
     # tight_layout emits warnings with dense title/legend combinations.
     fig.subplots_adjust(left=0.08, right=0.98, bottom=0.12, top=0.92)
 
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PLOTS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{profile_name}_fit_rms{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -1017,7 +1017,7 @@ def export_corrected_qc_plot(profile_name: str,
                  color=c["text"], fontsize=11)
     fig.tight_layout()
 
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PLOTS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{profile_name}_corrected_qc{filename_suffix}.png"
     if show_plot:
@@ -1208,7 +1208,7 @@ def export_arrivals_observed_computed_plot(profile_name: str,
 
     fig.suptitle(f"Profile {profile_name} - Observed/computed diagnostics", color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.08, top=0.93, wspace=0.18, hspace=0.22)
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PLOTS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{profile_name}_arrivals_obs_comp{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -1462,7 +1462,7 @@ def export_layer_fit_rms_plot(profile_name: str,
     fig.suptitle(f"Profile {profile_name} - Layer-fit RMS diagnostics", color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.20)
 
-    out_dir = OUTPUT_DIR / profile_name
+    out_dir = PLOTS_DIR / profile_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{profile_name}_layer_fit_rms{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())

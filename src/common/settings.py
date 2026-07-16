@@ -6,14 +6,16 @@ script. Values and names are unchanged from the original implementation.
 """
 from __future__ import annotations
 
-from src.common.paths import DATA_DIR
+from src.common.paths import GEOMETRY_DIR
 
 # ---------------------------------------------------------------------------
-# Geometry files: map trace number -> absolute receiver position (m along profile)
+# Geometry files:
+# Map geometry type -> receiver geometry definition file.
+# Files are stored under data/input/geometry/.
 # ---------------------------------------------------------------------------
 GEOM_FILES: dict = {
-    100: DATA_DIR / "geometry100.txt",
-    200: DATA_DIR / "geometry200.txt",
+    100: GEOMETRY_DIR / "geometry100.txt",
+    200: GEOMETRY_DIR / "geometry200.txt",
 }
 
 # ---------------------------------------------------------------------------
