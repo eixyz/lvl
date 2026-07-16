@@ -23,6 +23,14 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+# Importing directories
+from src.common.paths import (PROJECT_DIR, PICKS_DIR, SESSIONS_DIR, 
+                              REPORTS_DIR, IMPORT_PICKS_DIR, RAW_DIR,
+                              GEOMETRY_DIR, METADATA_DIR, VELOCITY_RESULTS_DIR,)
 
 def _dock_area_left() -> Any:
     area = getattr(QtCore.Qt, "DockWidgetArea", None)
@@ -62,9 +70,19 @@ def _dock_features(*feature_names: str) -> Any:
     return value
 
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "results"
+@dataclass
+class ProjectContext:
+    project_name: str | None = None
 
+    raw_folder: Path | None = None
+
+    geometry_file: Path | None = None
+
+    # field_reports: list[Path] = field(default_factory=list)
+
+    session_dir: Path | None = None
+
+    results_dir: Path | None = None
 
 @dataclass
 class ShotGather:
@@ -786,7 +804,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def _on_geometry_changed(self, text: str):
         t = str(text).strip().lower()
         if t == "custom":
-            start_dir = str(DATA_DIR if DATA_DIR.exists() else Path.cwd())
+            start_dir = str(GEOMETRY_DIR if GEOMETRY_DIR.exists() else Path.cwd())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Select geometry file (same format as geometry100.txt)",
                 start_dir, "Geometry (*.txt);;All files (*.*)"
@@ -1344,7 +1362,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         if not self.shots:
             QtWidgets.QMessageBox.information(self, "Import Picks", "Open a SEG2 folder first.")
             return
-        start_dir = str(self._current_folder or DATA_DIR if DATA_DIR.exists() else Path.cwd())
+        start_dir = str(self._current_folder or IMPORT_PICKS_DIR if IMPORT_PICKS_DIR.exists() else Path.cwd())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Import picks file", start_dir,
             "Picks (*.txt *.json);;Text picks (*.txt);;JSON picks (*.json);;All files (*.*)",
@@ -1717,7 +1735,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.display.canvas.draw_idle()
 
     def open_folder(self):
-        start_dir = str(DATA_DIR if DATA_DIR.exists() else Path.cwd())
+        start_dir = str(RAW_DIR if RAW_DIR.exists() else Path.cwd())
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select SEG2 folder", start_dir)
         if not folder:
             return
@@ -1752,62 +1770,87 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
     def _autoload_picks(self, profile_name: str) -> int:
         """Load existing picks (session first, then finalized) into the studio."""
-        base = OUTPUT_DIR / profile_name
-        for name in ("picks.session.json", "picks.json"):
-            p = base / name
+
+        candidates = (
+            SESSIONS_DIR / profile_name / "picks.session.json",
+            PICKS_DIR / profile_name / "picks.json",
+        )
+
+        for p in candidates:
             if not p.exists():
                 continue
+
             try:
                 with open(p, encoding="utf-8") as fh:
                     raw = json.load(fh)
             except Exception:
                 continue
+
             count = 0
+
             for sid_str, tr_map in (raw or {}).items():
                 try:
-                    sid = int(sid_str)
+                    idx = int(sid_str) - 1
                 except Exception:
                     continue
-                idx = sid - 1
-                if idx < 0 or idx >= len(self.shots):
+
+                if not (0 <= idx < len(self.shots)):
                     continue
+
                 shot_picks = self._shot_pick_map(idx)
+
                 for ti_str, tv in (tr_map or {}).items():
                     try:
                         shot_picks[int(ti_str)] = float(tv)
                     except Exception:
                         continue
+
                 if shot_picks:
                     count += 1
+
             if count:
                 return count
+
         return 0
 
     def _save_picks_current_profile(self):
         profile_name = self._profile_name_from_open_folder()
+
         if not profile_name or not self.shots:
-            # Fall back to explicit JSON export when not in a data/<profile> folder.
             self._save_picks_json()
             return
-        base = OUTPUT_DIR / profile_name
-        base.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, dict[str, float]] = {}
+
+        picks_dir = PICKS_DIR / profile_name
+        session_dir = SESSIONS_DIR / profile_name
+
+        picks_dir.mkdir(parents=True, exist_ok=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {}
         for idx in range(len(self.shots)):
             picks = self.picks_by_shot.get(idx, {})
-            if not picks:
-                continue
-            payload[str(idx + 1)] = {str(int(k)): float(v) for k, v in sorted(picks.items())}
-        for name in ("picks.json", "picks.session.json"):
-            with open(base / name, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-        self.statusBar().showMessage(f"Picks saved to output/{profile_name}/picks.json")
+            if picks:
+                payload[str(idx + 1)] = {
+                    str(int(k)): float(v)
+                    for k, v in sorted(picks.items())
+                }
+
+        with open(picks_dir / "picks.json", "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+        with open(session_dir / "picks.session.json", "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+        self.statusBar().showMessage(
+            f"Picks saved to {picks_dir.relative_to(PROJECT_DIR)}"
+        )
 
     def _profile_name_from_open_folder(self) -> str | None:
         if self._current_folder is None:
             return None
         folder = self._current_folder.resolve()
         try:
-            if folder.parent.resolve() == DATA_DIR.resolve():
+            if folder.parent.resolve() == RAW_DIR.resolve():
                 return folder.name
         except Exception:
             return None
@@ -1845,9 +1888,9 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
             from lvl_refraction import process_profile, discover_field_report_excels
 
-            report_paths = [str(p) for p in discover_field_report_excels(DATA_DIR)]
+            report_paths = [str(p) for p in discover_field_report_excels(METADATA_DIR)]
             geometry_paths: list[str] = []
-            for p in DATA_DIR.glob("LVL*.xls*"):
+            for p in GEOMETRY_DIR.glob("LVL*.xls*"):
                 name = p.name.lower()
                 if "field_report" in name or "fieldreport" in name:
                     continue
@@ -1876,11 +1919,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 show_plot_controls=True,
             )
 
-            self.statusBar().showMessage(f"Computation finished for {profile_name}. See lvl/output/{profile_name}")
+            self.statusBar().showMessage(f"Computation finished for {profile_name}. See lvl/data/results/reports/{profile_name}")
             QtWidgets.QMessageBox.information(
                 self,
                 "Computation Finished",
-                f"Full computation finished for profile '{profile_name}'.\nOutputs are in lvl/output/{profile_name}.",
+                f"Full computation finished for profile '{profile_name}'.\nOutputs are in lvl/data/results/reports/{profile_name}.",
             )
         except Exception as exc:
             tb = traceback.format_exc(limit=8)
@@ -1921,7 +1964,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         lr = self._backend()
         out: list[Path] = []
         seen: set[str] = set()
-        search_dirs = [DATA_DIR]
+        search_dirs = [METADATA_DIR, GEOMETRY_DIR]
         if self._current_folder is not None:
             search_dirs.append(self._current_folder)
         for d in search_dirs:
@@ -2057,7 +2100,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         try:
             analysis = lr.build_analysis_from_layers(a["corrected_by_shot"], a["layer_results"])
             geometry_paths = [str(p) for p in self._discover_geometry_excels()]
-            out_dir = OUTPUT_DIR / a["profile"]
+            out_dir = VELOCITY_RESULTS_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
             path = lr.export_velocity_summary_excel(
                 profile_name=a["profile"],
@@ -2066,7 +2109,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 shots_info=a["shots_info"],
                 layer_results=a["layer_results"],
                 analysis=analysis,
-                output_dir=OUTPUT_DIR,
+                output_dir= out_dir,
                 geometry_excel_paths=geometry_paths,
             )
             self.statusBar().showMessage(f"Excel summary saved: {path}")
@@ -2077,7 +2120,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
     def _discover_geometry_excels(self) -> list[Path]:
         out: list[Path] = []
-        for p in DATA_DIR.glob("LVL*.xls*"):
+        for p in GEOMETRY_DIR.glob("LVL*.xls*"):
             name = p.name.lower()
             if "field_report" in name or "fieldreport" in name:
                 continue

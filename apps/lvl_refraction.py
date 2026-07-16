@@ -68,16 +68,23 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-CWD = Path(__file__).resolve().parent
-PROJECT_DIR = CWD.parent
-sys.path.append(str(PROJECT_DIR))
+# CWD = Path(__file__).resolve().parent
+# PROJECT_DIR = CWD.parent
+# sys.path.append(str(PROJECT_DIR))
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+# Importing directories
+from src.common.paths import *
 
 import argparse
 import json
 import math
 import datetime
 import importlib
-import subprocess
+import subprocess 
 import tkinter as tk
 from tkinter import filedialog
 
@@ -124,7 +131,6 @@ import pandas as pd
 # CONFIG  --  single source of truth in src/common/settings.py + paths.py
 # ===========================================================================
 
-from src.common.paths import DATA_DIR, OUTPUT_DIR
 from src.common.settings import (
     GEOM_FILES, PROFILES, USE_SEG2_SHOT_POSITION,
     BP_F1, BP_F2, BP_F3, BP_F4, BP_FFT_PAD, BP_REAPPLY, BUTTER_ORDER,
@@ -1353,7 +1359,7 @@ class FirstBreakPicker:
         self.delay_ms = delay_ms
         self.shot_id = shot_id
         self.profile = profile_name
-        self.qc_dir = qc_dir or (OUTPUT_DIR / profile_name)
+        self.qc_dir = qc_dir or (PLOTS_DIR / profile_name)
 
         self._picks: dict = {}
         self._saved = False
@@ -2805,7 +2811,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         }
         print(f"  [INFO] Profile '{profile_name}' not in PROFILES; using dynamic defaults.")
 
-    data_dir = DATA_DIR / profile_name
+    data_dir = RAW_DIR / profile_name
     if not data_dir.exists():
         print(f"[ERROR] Data folder not found: {data_dir}")
         return
@@ -2900,7 +2906,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     else:
         all_picks = {sid: dict(vals) for sid, vals in final_picks.items()}
     shots_meta: list = []
-    qc_dir = OUTPUT_DIR / profile_name
+    qc_dir = PLOTS_DIR / profile_name
     finalized = False
 
     shot_cache: list = []
@@ -3179,7 +3185,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         shots_info=shots_info_proc,
         layer_results=layer_results,
         analysis=analysis,
-        output_dir=OUTPUT_DIR,
+        output_dir=VELOCITY_RESULTS_DIR,
         geometry_excel_paths=geometry_excels,
         acquisition_time_de=acquisition_time_de,
         seg2_mid_xyz=seg2_mid_xyz,
@@ -3188,7 +3194,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     save_layer_json(profile_name, layer_results)
     clear_session_picks_json(profile_name)
     clear_layer_session_json(profile_name)
-    print(f"\n  Output -> {(OUTPUT_DIR / profile_name).relative_to(CWD.parent)}")
+    print(f"\n  Output -> "  f"{(RESULTS_DIR / profile_name).relative_to(PROJECT_DIR)}")
 
 
 
@@ -3275,7 +3281,7 @@ def main():
             print("        100, 200, geometry100, geometry200")
             return
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     sheet_val: str | int | None = args.perp_sheet
     if sheet_val is not None:
@@ -3287,12 +3293,12 @@ def main():
     if args.perp_excel:
         report_paths = [str(Path(args.perp_excel))]
     else:
-        report_paths = [str(p) for p in discover_field_report_excels(DATA_DIR)]
+        report_paths = [str(p) for p in discover_field_report_excels(METADATA_DIR)]
         if report_paths:
             print("  Auto field reports detected:")
             for p in report_paths:
                 try:
-                    print(f"    - {Path(p).relative_to(CWD.parent)}")
+                    print(f"    - {Path(p).relative_to(METADATA_DIR.parent)}")
                 except Exception:
                     print(f"    - {p}")
 
@@ -3303,7 +3309,7 @@ def main():
                 geometry_paths.append(str(Path(cp)))
             except Exception:
                 pass
-    for p in DATA_DIR.glob("LVL*.xls*"):
+    for p in GEOMETRY_DIR.glob("LVL*.xls*"):
         name = p.name.lower()
         if "field_report" in name or "fieldreport" in name:
             continue
@@ -3325,9 +3331,9 @@ def main():
     }
 
     if args.all:
-        targets = discover_profile_folders(DATA_DIR)
+        targets = discover_profile_folders(RAW_DIR)
         if not targets:
-            print("[ERROR] No profile folders with SEG2 files found under data/.")
+            print("[ERROR] No profile folders with SEG2 files found under data/input/raw/.")
             return
     elif args.profile:
         targets = [args.profile]
@@ -3338,13 +3344,13 @@ def main():
             root.withdraw()
             sel = filedialog.askdirectory(
                 title="Select profile data folder",
-                initialdir=str(DATA_DIR),
+                initialdir=str(RAW_DIR),
                 mustexist=True,
             )
             root.destroy()
             if sel:
                 p = Path(sel)
-                if p.parent.resolve() == DATA_DIR.resolve():
+                if p.parent.resolve() == RAW_DIR.resolve():
                     chosen_profile = p.name
         except Exception:
             chosen_profile = None
@@ -3356,12 +3362,12 @@ def main():
             print("\nAvailable profiles:")
             print(f"  {'Name':<16}  {'Geom':>6}  {'Data folder':<30}")
             print(f"  {'-'*16}  {'-'*6}  {'-'*30}")
-            dynamic_profiles = discover_profile_folders(DATA_DIR)
+            dynamic_profiles = discover_profile_folders(RAW_DIR)
             if not dynamic_profiles:
                 print("  (none found)")
             for pname in dynamic_profiles:
                 pcfg = PROFILES.get(pname, {"geom": 200})
-                folder = DATA_DIR / pname
+                folder = RAW_DIR / pname
                 n_seg2 = len(list(folder.glob("*.seg2"))) + len(list(folder.glob("*.SEG2")))
                 print(f"  {pname:<16}  {int(pcfg.get('geom', 200)):>5}m  "
                       f"found ({n_seg2} SEG2 files)")
