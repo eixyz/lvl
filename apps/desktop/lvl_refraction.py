@@ -68,19 +68,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# CWD = Path(__file__).resolve().parent
-# PROJECT_DIR = CWD.parent
-# sys.path.append(str(PROJECT_DIR))
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
-# Importing directories
-from src.common.paths import *
-from src.common import paths as core_paths
-from src.io import project_io as pio
-
 import argparse
 import json
 import math
@@ -93,6 +80,7 @@ from tkinter import filedialog
 from typing import Any
 from zoneinfo import ZoneInfo
 from src.communication.control_bridge import read_latest_picker_command
+from src.common.paths import PROJECT_DIR
 
 # ---------------------------------------------------------------------------
 # Auto-install missing packages into the active environment
@@ -1361,7 +1349,7 @@ class FirstBreakPicker:
         self.delay_ms = delay_ms
         self.shot_id = shot_id
         self.profile = profile_name
-        self.qc_dir = qc_dir or core_paths.require_active_project().plots_dir_for(profile_name)
+        self.qc_dir = qc_dir or (PLOTS_DIR / profile_name)
 
         self._picks: dict = {}
         self._saved = False
@@ -2782,16 +2770,14 @@ def process_profile(profile_name: str, pick_mode: bool = True,
                     perp_excel_cfg: dict | None = None,
                     enable_layer_pick: bool = True,
                     control_file: Path | None = None,
-                    show_plot_controls: bool = True,
-                    raw_dir: Path | None = None):
+                    show_plot_controls: bool = True):
     """
     Run the full profile pipeline: pick, correct, analyze, and export.
 
     Parameters
     ----------
     profile_name : str
-        Profile key from PROFILES (also expected folder name under the
-        project's raw data folder).
+        Profile key from PROFILES (also expected folder name under data/).
     pick_mode : bool, optional
         True: open interactive picker. False: export-only mode using saved picks.
     geom_override : int | None, optional
@@ -2804,9 +2790,6 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         Excel mapping configuration for loading default PO/X-shift values.
     enable_layer_pick : bool, optional
         Enable interactive layer-window picking/review stage.
-    raw_dir : Path | None, optional
-        Folder containing one SEG2 subfolder per profile. Defaults to the
-        active project's `raw_folder` if not given explicitly.
     """
     cfg = PROFILES.get(profile_name)
     if cfg is None:
@@ -2818,13 +2801,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         }
         print(f"  [INFO] Profile '{profile_name}' not in PROFILES; using dynamic defaults.")
 
-    if raw_dir is None:
-        print(
-            "[ERROR] No raw_dir given. Pass raw_dir=project.raw_folder "
-            "(see src.io.project_io.Project) or call main() with --project."
-        )
-        return
-    data_dir = Path(raw_dir) / profile_name
+    data_dir = RAW_DIR / profile_name
     if not data_dir.exists():
         print(f"[ERROR] Data folder not found: {data_dir}")
         return
@@ -2919,7 +2896,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     else:
         all_picks = {sid: dict(vals) for sid, vals in final_picks.items()}
     shots_meta: list = []
-    qc_dir = core_paths.require_active_project().plots_dir_for(profile_name)
+    qc_dir = PLOTS_DIR / profile_name
     finalized = False
 
     shot_cache: list = []
@@ -3198,7 +3175,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         shots_info=shots_info_proc,
         layer_results=layer_results,
         analysis=analysis,
-        output_dir=core_paths.require_active_project().velocity_dir,
+        output_dir=VELOCITY_RESULTS_DIR,
         geometry_excel_paths=geometry_excels,
         acquisition_time_de=acquisition_time_de,
         seg2_mid_xyz=seg2_mid_xyz,
@@ -3207,8 +3184,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     save_layer_json(profile_name, layer_results)
     clear_session_picks_json(profile_name)
     clear_layer_session_json(profile_name)
-    _ap = core_paths.require_active_project()
-    print(f"\n  Output -> " f"{(_ap.results_dir / profile_name).relative_to(_ap.root)}")
+    print(f"\n  Output -> "  f"{(RESULTS_DIR / profile_name).relative_to(PROJECT_DIR)}")
 
 
 
@@ -3268,49 +3244,7 @@ def main():
                         help="Hide in-plot buttons/widgets and use external GUI controls")
     parser.add_argument("--no-layer-pick", action="store_true",
                         help="Skip interactive x0..x5 layer-window picking")
-    parser.add_argument("--project", default=None,
-                        help="Path to a project folder (created with lvl_studio or "
-                             "src.io.project_io.create_project). If omitted, you'll be "
-                             "prompted to pick or create one.")
     args = parser.parse_args()
-
-    # -- resolve the active project -----------------------------------------
-    project = None
-    if args.project:
-        try:
-            project = pio.open_project(args.project)
-        except pio.ProjectNotFoundError:
-            print(f"[ERROR] No project.json found at: {args.project}")
-            return
-    else:
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            sel = filedialog.askdirectory(
-                title="Select or create a project folder",
-                initialdir=str(core_paths.PROJECTS_ROOT) if core_paths.PROJECTS_ROOT.exists() else str(Path.cwd()),
-                mustexist=False,
-            )
-            root.destroy()
-        except Exception:
-            sel = None
-        if not sel:
-            print("[ERROR] No project selected. Re-run with --project <path>.")
-            return
-        if pio.is_project_dir(sel):
-            project = pio.open_project(sel)
-        else:
-            name = Path(sel).name
-            project = pio.create_project(name, parent_dir=Path(sel).parent)
-            print(f"  Created new project '{project.name}' at {project.root}")
-
-    project.activate()
-    print(f"  Project : {project.name}  ({project.root})")
-    if project.raw_folder is None:
-        print(
-            "  [WARN] Project has no raw_folder set. Set one via lvl_studio's "
-            "'Project Settings...', or edit project.json directly."
-        )
 
     try:
         perp_override = parse_shot_value_map(args.perp_by_shot)
@@ -3337,7 +3271,7 @@ def main():
             print("        100, 200, geometry100, geometry200")
             return
 
-    project.paths.results_dir.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     sheet_val: str | int | None = args.perp_sheet
     if sheet_val is not None:
@@ -3348,13 +3282,13 @@ def main():
     report_paths: list = []
     if args.perp_excel:
         report_paths = [str(Path(args.perp_excel))]
-    elif project.metadata_folder is not None:
-        report_paths = [str(p) for p in discover_field_report_excels(project.metadata_folder)]
+    else:
+        report_paths = [str(p) for p in discover_field_report_excels(METADATA_DIR)]
         if report_paths:
             print("  Auto field reports detected:")
             for p in report_paths:
                 try:
-                    print(f"    - {Path(p).relative_to(project.metadata_folder.parent)}")
+                    print(f"    - {Path(p).relative_to(METADATA_DIR.parent)}")
                 except Exception:
                     print(f"    - {p}")
 
@@ -3365,14 +3299,13 @@ def main():
                 geometry_paths.append(str(Path(cp)))
             except Exception:
                 pass
-    if project.geometry_folder is not None:
-        for p in project.geometry_folder.glob("LVL*.xls*"):
-            name = p.name.lower()
-            if "field_report" in name or "fieldreport" in name:
-                continue
-            sp = str(p)
-            if sp not in geometry_paths:
-                geometry_paths.append(sp)
+    for p in GEOMETRY_DIR.glob("LVL*.xls*"):
+        name = p.name.lower()
+        if "field_report" in name or "fieldreport" in name:
+            continue
+        sp = str(p)
+        if sp not in geometry_paths:
+            geometry_paths.append(sp)
 
     print(f"  Device type: {args.device_type}")
 
@@ -3387,15 +3320,10 @@ def main():
         "device_type": args.device_type,
     }
 
-    raw_dir = project.raw_folder
-    if raw_dir is None:
-        print("[ERROR] Project has no raw_folder set (see 'Project Settings...' in lvl_studio).")
-        return
-
     if args.all:
-        targets = discover_profile_folders(raw_dir)
+        targets = discover_profile_folders(RAW_DIR)
         if not targets:
-            print(f"[ERROR] No profile folders with SEG2 files found under {raw_dir}.")
+            print("[ERROR] No profile folders with SEG2 files found under data/input/raw/.")
             return
     elif args.profile:
         targets = [args.profile]
@@ -3406,13 +3334,13 @@ def main():
             root.withdraw()
             sel = filedialog.askdirectory(
                 title="Select profile data folder",
-                initialdir=str(raw_dir),
+                initialdir=str(RAW_DIR),
                 mustexist=True,
             )
             root.destroy()
             if sel:
                 p = Path(sel)
-                if p.parent.resolve() == raw_dir.resolve():
+                if p.parent.resolve() == RAW_DIR.resolve():
                     chosen_profile = p.name
         except Exception:
             chosen_profile = None
@@ -3424,16 +3352,16 @@ def main():
             print("\nAvailable profiles:")
             print(f"  {'Name':<16}  {'Geom':>6}  {'Data folder':<30}")
             print(f"  {'-'*16}  {'-'*6}  {'-'*30}")
-            dynamic_profiles = discover_profile_folders(raw_dir)
+            dynamic_profiles = discover_profile_folders(RAW_DIR)
             if not dynamic_profiles:
                 print("  (none found)")
             for pname in dynamic_profiles:
                 pcfg = PROFILES.get(pname, {"geom": 200})
-                folder = raw_dir / pname
+                folder = RAW_DIR / pname
                 n_seg2 = len(list(folder.glob("*.seg2"))) + len(list(folder.glob("*.SEG2")))
                 print(f"  {pname:<16}  {int(pcfg.get('geom', 200)):>5}m  "
                       f"found ({n_seg2} SEG2 files)")
-            print(f"\nUsage:  python lvl_refraction.py <profile> --project <path>  [--export-only]")
+            print(f"\nUsage:  python lvl_refraction.py <profile>  [--export-only]")
             return
 
     for pname in targets:
@@ -3445,13 +3373,12 @@ def main():
                         perp_excel_cfg=perp_excel_cfg,
                         enable_layer_pick=not args.no_layer_pick,
                         control_file=(Path(args.control_file) if args.control_file else None),
-                        show_plot_controls=not args.minimal_plot_controls,
-                        raw_dir=raw_dir)
-        project.register_profile(pname)
+                        show_plot_controls=not args.minimal_plot_controls)
 
-    pio.save_project(project)
     print("\nAll done.")
 
 
 if __name__ == "__main__":
     main()
+
+

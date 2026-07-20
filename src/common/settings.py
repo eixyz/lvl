@@ -6,16 +6,17 @@ script. Values and names are unchanged from the original implementation.
 """
 from __future__ import annotations
 
-from src.common.paths import GEOMETRY_DIR
+from src.common.paths import GEOM_TEMPLATES_DIR
 
 # ---------------------------------------------------------------------------
 # Geometry files:
 # Map geometry type -> receiver geometry definition file.
-# Files are stored under data/input/geometry/.
+# These are bundled app-level templates (fixed receiver spacings), not
+# part of any one project - see src.common.paths for the distinction.
 # ---------------------------------------------------------------------------
 GEOM_FILES: dict = {
-    100: GEOMETRY_DIR / "geometry100.txt",
-    200: GEOMETRY_DIR / "geometry200.txt",
+    100: GEOM_TEMPLATES_DIR / "geometry100.txt",
+    200: GEOM_TEMPLATES_DIR / "geometry200.txt",
 }
 
 # ---------------------------------------------------------------------------
