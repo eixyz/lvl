@@ -780,7 +780,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self._render_current()
 
     def _backend(self):
-        import lvl.sandbox.scripts.lvl_refraction as lr
+        import lvl_refraction as lr
         return lr
 
     def _on_geometry_changed(self, text: str):
@@ -1814,7 +1814,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return None
 
     def _export_picks_to_lvl_refraction_session(self, profile_name: str):
-        from lvl.sandbox.scripts.lvl_refraction import save_session_picks_json
+        from lvl_refraction import save_session_picks_json
 
         all_picks: dict[int, dict[int, float]] = {}
         for idx in range(len(self.shots)):
@@ -1843,7 +1843,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         try:
             self._export_picks_to_lvl_refraction_session(profile_name)
 
-            from lvl.sandbox.scripts.lvl_refraction import process_profile, discover_field_report_excels
+            from lvl_refraction import process_profile, discover_field_report_excels
 
             report_paths = [str(p) for p in discover_field_report_excels(DATA_DIR)]
             geometry_paths: list[str] = []

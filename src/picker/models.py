@@ -1,56 +1,83 @@
+"""
+Picker Engine V2 - data structures.
+
+Pure data containers used throughout the picking pipeline
+(preprocessing -> features -> likelihood -> coherence -> optimizer ->
+confidence -> quality -> picker). No algorithm code lives here.
+
+See docs/picker_v2/ (or the design note it was generated from) for the
+overall pipeline description.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import numpy as np
+from typing import Any
 
 
-@dataclass(slots=True)
+@dataclass
 class FeatureSet:
+    """Per-sample, normalized (0-1) feature curves for one trace.
+
+    Every array has the same length as the input trace. Features that
+    aren't computed for a given call are left as None rather than being
+    filled with zeros, so downstream code can tell "not computed" apart
+    from "computed and equal to zero".
     """
-    Normalized feature vectors.
-    Every feature has exactly the same length as the trace.
-    Values are normalized to [0,1].
-    """
 
-    hilbert: np.ndarray
-    stalta: np.ndarray
-    aic: np.ndarray
-    gradient: np.ndarray
-    energy: np.ndarray
-    coherence: np.ndarray | None = None
+    hilbert: Any = None
+    stalta: Any = None
+    aic: Any = None
+    gradient: Any = None
+    energy: Any = None
+    snr: Any = None
+    kurtosis: Any = None
+    skewness: Any = None
+    coherence: Any = None
+
+    def as_dict(self) -> dict:
+        return {
+            "hilbert": self.hilbert,
+            "stalta": self.stalta,
+            "aic": self.aic,
+            "gradient": self.gradient,
+            "energy": self.energy,
+            "snr": self.snr,
+            "kurtosis": self.kurtosis,
+            "skewness": self.skewness,
+            "coherence": self.coherence,
+        }
+
+    def available(self) -> list[str]:
+        """Names of the features that were actually computed (not None)."""
+        return [name for name, value in self.as_dict().items() if value is not None]
 
 
-@dataclass(slots=True)
+@dataclass
 class PickResult:
-    """
-    Final picker output.
-    """
+    """Outcome of picking a single trace."""
 
-    sample: int
-    time: float
+    sample: int | None = None
+    time: float | None = None                 # seconds, from trace start
+    confidence: float | None = None            # 0-1
+    likelihood: float | None = None            # arrival probability at `sample`
+    arrival_probability: Any = None            # full per-sample probability vector
 
-    confidence: float
+    candidate_samples: list[int] = field(default_factory=list)
+    candidate_scores: list[float] = field(default_factory=list)
 
-    likelihood: np.ndarray
+    quality_flags: list[str] = field(default_factory=list)
+    features: FeatureSet | None = None
 
-    features: FeatureSet
-
-    method: str = "Likelihood"
-
+    method: str | None = None                  # e.g. "stalta", "hilbert_env", "v2"
     metadata: dict = field(default_factory=dict)
 
-@dataclass(slots=True)
-class PickerSettings:
+    @property
+    def is_valid(self) -> bool:
+        return self.sample is not None and self.time is not None
 
-    hilbert_weight: float = 1.0
-    stalta_weight: float = 1.0
-    aic_weight: float = 1.5
-    gradient_weight: float = 0.8
-    energy_weight: float = 0.8
-    coherence_weight: float = 2.0
+    def add_flag(self, flag: str) -> None:
+        if flag not in self.quality_flags:
+            self.quality_flags.append(flag)
 
-    smoothness_penalty: float = 0.15
 
-    coherence_radius: int = 2
-
-    min_confidence: float = 0.35
+__all__ = ["FeatureSet", "PickResult"]

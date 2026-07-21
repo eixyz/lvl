@@ -1,10 +1,10 @@
 {
   "name": "LVL_Erfurt",
-  "raw_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\raw\\125",
+  "raw_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\raw\\150",
   "geometry_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\geometry",
   "metadata_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\metadata",
   "profiles": [],
   "notes": "",
   "created": "2026-07-20T10:19:52+00:00",
-  "modified": "2026-07-20T10:21:08+00:00"
+  "modified": "2026-07-21T15:25:43+00:00"
 }

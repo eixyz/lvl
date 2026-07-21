@@ -17,7 +17,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 import matplotlib.pyplot as plt
 
-from src.common.paths import PROJECT_DIR, PICKS_DIR, PLOTS_DIR
+from src.common.paths import require_active_project
 from src.common.settings import (
     T_MAX_MS, theme_colors, _ensure_interactive_backend,
     BP_F1, BP_F2, BP_F3, BP_F4, BP_FFT_PAD, BULK_SHIFT_MS,
@@ -38,6 +38,21 @@ _FONT_HDR  = Font(bold=True, color="FFFFFF")
 _FONT_BOLD = Font(bold=True)
 _FONT_ITA  = Font(italic=True, color="888888")
 
+def _project():
+    return require_active_project()
+
+def report_directory(profile: str) -> Path:
+    return _project().ensure_dir(_project().reports_dir_for(profile))
+
+
+def plots_directory(profile: str) -> Path:
+    p = _project().plots_dir_for(profile)
+    return _project().ensure_dir(p)
+
+
+def velocity_directory() -> Path:
+    p = _project().velocity_dir
+    return _project().ensure_dir(p)
 
 def export_velocity_summary_excel(profile_name: str,
                                   cfg: dict,
@@ -153,10 +168,7 @@ def export_velocity_summary_excel(profile_name: str,
         )
 
     if src is not None:
-        try:
-            src_rel = src.relative_to(PROJECT_DIR)
-        except Exception:
-            src_rel = src
+        src_rel = _project().relative(Path(src))
         if s_min is not None and s_mid is not None and s_max is not None:
             print(
                 f"  Geometry loaded from: {src_rel} | "
@@ -251,13 +263,13 @@ def export_velocity_summary_excel(profile_name: str,
     _autofit_xl(ws)
     try:
         wb.save(str(out_path))
-        print(f"  Velocity summary -> {out_path.relative_to(PROJECT_DIR)}")
+        print(f"  Velocity summary -> {_project().relative(out_path)}")
         return out_path
     except PermissionError:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         alt = out_path.with_name(f"{out_path.stem}_{stamp}{out_path.suffix}")
         wb.save(str(alt))
-        print(f"  [WARN] Summary file locked; wrote fallback -> {alt.relative_to(PROJECT_DIR)}")
+        print(f"  [WARN] Summary file locked; wrote fallback -> {_project().relative(alt)}")
         return alt
 
 def _chdr(ws: Any, row: int, col: int, val: str):
@@ -297,8 +309,7 @@ def export_excel(profile_name: str, shots_info: list,
     Analysis  Python-computed velocities, intercept times, depths (green),
               R^2, RMS.  Depth formula reference below the table.
     """
-    out_dir = PICKS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _project().ensure_dir(_project().picks_dir_for(profile_name))
     xl_path = out_dir / f"{profile_name}_picks{filename_suffix}.xlsx"
     wb      = openpyxl.Workbook()
 
@@ -626,14 +637,13 @@ def export_excel(profile_name: str, shots_info: list,
 
     _autofit_xl(ws_a)
     wb.save(str(xl_path))
-    print(f"  Excel     -> {xl_path.relative_to(PROJECT_DIR)}")
+    print(f"  Excel     -> {_project().relative(xl_path)}")
     return xl_path
 
 def export_picks_txt(profile_name: str, shots_info: list,
                      all_picks: dict, recv_positions: Any) -> Path:
     """Write Ensemble / SOURCE / CHAN / OFFSET / FB_PICK text file."""
-    out_dir  = PICKS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir  = _project().ensure_dir(_project().picks_dir_for(profile_name))
     txt_path = out_dir / f"{profile_name}_picks_clean.txt"
     header   = (f"{'Ensemble':>10} {'#':>4} {'SOURCE':>8} "
                 f"{'CHAN':>6} {'OFFSET':>10} {'FB_PICK':>10}")
@@ -656,7 +666,7 @@ def export_picks_txt(profile_name: str, shots_info: list,
                          f"{corr[trace_idx]:>10.3f}\n")
                 ens += 1
 
-    print(f"  picks_txt -> {txt_path.relative_to(PROJECT_DIR)}")
+    print(f"  picks_txt -> {_project().relative(txt_path)}")
     return txt_path
 
 def export_tx_plot(profile_name: str, shots_info: list,
@@ -817,13 +827,12 @@ def export_tx_plot(profile_name: str, shots_info: list,
                  color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.12)
 
-    out_dir = PLOTS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _project().ensure_dir(_project().plots_dir_for(profile_name))
     out = out_dir / f"{profile_name}_tx_picks.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
-    print(f"  T-X plot  -> {out.relative_to(PROJECT_DIR)}")
+    print(f"  T-X plot  -> {_project().relative(out)}")
     return out
 
 def export_fit_plot(profile_name: str,
@@ -911,12 +920,11 @@ def export_fit_plot(profile_name: str,
     # tight_layout emits warnings with dense title/legend combinations.
     fig.subplots_adjust(left=0.08, right=0.98, bottom=0.12, top=0.92)
 
-    out_dir = PLOTS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _project().ensure_dir(_project().plots_dir_for(profile_name))
     out = out_dir / f"{profile_name}_fit_rms{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    print(f"  Fit plot  -> {out.relative_to(PROJECT_DIR)}")
+    print(f"  Fit plot  -> {_project().relative(out)}")
     return out
 
 def export_corrected_qc_plot(profile_name: str,
@@ -1017,8 +1025,7 @@ def export_corrected_qc_plot(profile_name: str,
                  color=c["text"], fontsize=11)
     fig.tight_layout()
 
-    out_dir = PLOTS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _project().ensure_dir(_project().plots_dir_for(profile_name))
     out = out_dir / f"{profile_name}_corrected_qc{filename_suffix}.png"
     if show_plot:
         try:
@@ -1034,7 +1041,7 @@ def export_corrected_qc_plot(profile_name: str,
             pass
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    print(f"  corrected_qc -> {out.relative_to(PROJECT_DIR)}")
+    print(f"  corrected_qc -> {_project().relative(out)}")
     return out
 
 def export_arrivals_observed_computed_plot(profile_name: str,
@@ -1208,12 +1215,12 @@ def export_arrivals_observed_computed_plot(profile_name: str,
 
     fig.suptitle(f"Profile {profile_name} - Observed/computed diagnostics", color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.08, top=0.93, wspace=0.18, hspace=0.22)
-    out_dir = PLOTS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir = _project().ensure_dir(_project().plots_dir_for(profile_name))
     out = out_dir / f"{profile_name}_arrivals_obs_comp{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    print(f"  arrivals   -> {out.relative_to(PROJECT_DIR)}")
+    print(f"  arrivals   -> {_project().relative(out)}")
     return out
 
 def export_layer_fit_rms_plot(profile_name: str,
@@ -1462,10 +1469,9 @@ def export_layer_fit_rms_plot(profile_name: str,
     fig.suptitle(f"Profile {profile_name} - Layer-fit RMS diagnostics", color=c["text"], fontsize=11)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.11, top=0.90, wspace=0.20)
 
-    out_dir = PLOTS_DIR / profile_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _project().ensure_dir(_project().plots_dir_for(profile_name))
     out = out_dir / f"{profile_name}_layer_fit_rms{filename_suffix}.png"
     fig.savefig(str(out), dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    print(f"  layer_fit -> {out.relative_to(PROJECT_DIR)}")
+    print(f"  layer_fit -> {_project().relative(out)}")
     return out

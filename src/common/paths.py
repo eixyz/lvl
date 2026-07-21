@@ -174,6 +174,9 @@ class ProjectPaths:
     def reports_dir_for(self, profile: str) -> Path:
         return self.reports_dir / profile
 
+    def picks_dir_for(self, profile: str) -> Path:
+        return self.picks_dir / profile
+
     # -- bookkeeping ------------------------------------------------------
     def all_dirs(self) -> list[Path]:
         return [
@@ -186,6 +189,10 @@ class ProjectPaths:
         for d in self.all_dirs():
             d.mkdir(parents=True, exist_ok=True)
         return self
+    
+    def ensure_dir(self, path: Path) -> Path:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def relative(self, path: Path) -> str:
         """Best-effort path for display/logging, relative to the project root."""

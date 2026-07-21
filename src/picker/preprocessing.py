@@ -204,3 +204,133 @@ def apply_gain(data: Any, dt_s: float,
         return out
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# Picker Engine V2 - signal conditioning before feature extraction.
+#
+# These are deliberately separate from `apply_gain`/`ormsby`/`butterworth_*`
+# above, which are the *display-time* filters the GUI toggles live. The
+# functions below feed `src.picker.features.extract_features` and should
+# not depend on any GUI state.
+# -----------------------------------------------------------------------------
+
+def remove_dc(trace: Any) -> Any:
+    """Subtract the mean (DC offset) from a trace."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size == 0:
+        return x.astype(np.float32)
+    return (x - np.mean(x)).astype(np.float32)
+
+
+def remove_trend(trace: Any) -> Any:
+    """Remove a linear trend from a trace (scipy detrend)."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size < 2:
+        return x.astype(np.float32)
+    from scipy.signal import detrend as _scipy_detrend
+    return _scipy_detrend(x, type="linear").astype(np.float32)
+
+
+def normalize_trace(trace: Any) -> Any:
+    """Scale a trace to a maximum absolute amplitude of 1.0."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size == 0:
+        return x.astype(np.float32)
+    mx = float(np.max(np.abs(x)))
+    if mx < 1e-20:
+        return x.astype(np.float32)
+    return (x / mx).astype(np.float32)
+
+
+def clip_outliers(trace: Any, n_std: float = 5.0) -> Any:
+    """Clip samples beyond `n_std` standard deviations (spike suppression)."""
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size == 0:
+        return x.astype(np.float32)
+    std = float(np.std(x))
+    if std < 1e-20:
+        return x.astype(np.float32)
+    limit = n_std * std
+    return np.clip(x, -limit, limit).astype(np.float32)
+
+
+def automatic_gain_control(trace: Any, dt_s: float, window_ms: float = AGC_WINDOW_MS,
+                           stat: str = AGC_STAT) -> Any:
+    """Single-trace AGC (thin wrapper over `apply_gain` for one trace)."""
+    x = np.asarray(trace, dtype=np.float32)
+    return apply_gain(x[np.newaxis, :], dt_s, mode="agc", window_ms=window_ms, stat=stat)[0]
+
+
+def time_variant_gain(trace: Any, dt_s: float, power: float = 1.0) -> Any:
+    """Simple t^power gain to compensate geometric spreading before picking.
+
+    `power=1.0` is a common linear-gain default for near-surface refraction;
+    raise it to boost late arrivals more aggressively.
+    """
+    x = np.asarray(trace, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return x.astype(np.float32)
+    t = np.arange(n, dtype=np.float64) * dt_s
+    gain = np.power(np.maximum(t, dt_s), power)
+    return (x * gain).astype(np.float32)
+
+
+def estimate_noise_window(trace: Any, dt_s: float, fraction: float = 0.1) -> tuple[float, float]:
+    """Default pre-shot noise window: the first `fraction` of the trace."""
+    x = np.asarray(trace, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return 0.0, 0.0
+    end_sample = max(1, int(n * float(np.clip(fraction, 0.01, 0.9))))
+    return 0.0, end_sample * dt_s
+
+
+def estimate_signal_window(trace: Any, dt_s: float, noise_fraction: float = 0.1) -> tuple[float, float]:
+    """Default expected-signal window: everything after `estimate_noise_window`."""
+    x = np.asarray(trace, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return 0.0, 0.0
+    _, noise_end_s = estimate_noise_window(x, dt_s, noise_fraction)
+    return noise_end_s, (n - 1) * dt_s
+
+
+def preprocess_trace(
+    trace: Any,
+    dt_s: float,
+    remove_dc_flag: bool = True,
+    remove_trend_flag: bool = False,
+    clip_flag: bool = True,
+    clip_n_std: float = 5.0,
+    bandpass: bool = False,
+    f1: float = BP_F1, f2: float = BP_F2, f3: float = BP_F3, f4: float = BP_F4,
+    normalize: bool = False,
+) -> Any:
+    """Signal conditioning pipeline feeding `features.extract_features`.
+
+    Order: remove DC -> (optional) detrend -> (optional) clip outliers ->
+    (optional) Ormsby bandpass -> (optional) normalize.
+
+    All steps are opt-out (not opt-in) except detrend/bandpass/normalize,
+    which default off: detrending and amplitude normalization can distort
+    the energy/SNR/AGC-sensitive features downstream, so they're only
+    applied if the caller explicitly asks for them.
+    """
+    x = np.asarray(trace, dtype=np.float64)
+    if x.size == 0:
+        return x.astype(np.float32)
+
+    if remove_dc_flag:
+        x = remove_dc(x)
+    if remove_trend_flag:
+        x = remove_trend(x)
+    if clip_flag:
+        x = clip_outliers(x, n_std=clip_n_std)
+    if bandpass:
+        x = ormsby(x, dt_s, f1=f1, f2=f2, f3=f3, f4=f4)
+    if normalize:
+        x = normalize_trace(x)
+
+    return np.asarray(x, dtype=np.float32)
