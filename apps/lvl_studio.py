@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 import numpy as np
 from obspy import read as obspy_read
+from obspy import Trace
 
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -30,8 +31,34 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Importing directories / project system
 from src.common import paths as core_paths
-from src.common.paths import GEOM_TEMPLATES_DIR, LEGACY_IMPORT_PICKS_DIR
+from src.common.paths import GEOM_TEMPLATES_DIR, ASSETS_DIR
+from src.common.settings import APP_NAME, APP_VERSION, GEOM_FILES
 from src.io import project_io as pio
+
+# Everything below is imported directly from src/ - lvl_studio.py has no
+# module-level or runtime dependency on lvl_refraction.py at all anymore.
+# process_profile and AnalysisWorkflow live in src/refraction/pipeline.py
+# (shared with the CLI) - see docs/architecture.md.
+from src.utils.geometry import (
+    load_geometry,
+    load_profile_geometry_from_excels,
+    infer_geometry_from_seg2_file,
+    discover_field_report_excels,
+    load_profile_offsets_from_excel,
+)
+from src.picker.preprocessing import (
+    apply_butterworth_all_params,
+    apply_ormsby_all_params,
+    apply_cutpass_all_params,
+    apply_gain,
+)
+from src.picker.refinement import _zero_crossing_from_extremum_samples
+from src.picker.features import hilbert_envelope_pick
+from src.io.pick_reader import save_session_picks_json
+from src.io.exporters import export_velocity_summary_excel
+from src.refraction.pipeline import AnalysisWorkflow
+from src.refraction.velocity_model import compute_layer_averages
+from src.refraction.layer_analysis import build_analysis_from_layers
 
 def _dock_area_left() -> Any:
     area = getattr(QtCore.Qt, "DockWidgetArea", None)
@@ -322,8 +349,10 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1500, 900)
+        self._apply_app_icon()
 
         self.project: pio.Project | None = None
+        self.current_profile: str | None = None
         self._update_window_title()
 
         self.settings = StudioSettings()
@@ -364,6 +393,61 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def picks_by_shot(self, value: dict[int, dict[int, float]]):
         self.pick_layers[self.active_layer] = value
 
+    # -- Branding (logo/icon, About dialog) --------------------------------
+
+    def _apply_app_icon(self):
+        """Set the window/taskbar icon from resources/assets, if present.
+
+        Looks for `lvl_icon.png` first (small, square, meant for window
+        icons), falling back to `lvl_logo.png`. Missing assets are silently
+        skipped rather than erroring, so this never blocks startup -
+        drop a real logo in `resources/assets/` (same filenames) to
+        replace the placeholder.
+        """
+        for name in ("lvl_icon.png", "lvl_logo.png"):
+            p = ASSETS_DIR / name
+            if p.exists():
+                self.setWindowIcon(QtGui.QIcon(str(p)))
+                return
+
+    def _show_about_dialog(self):
+        logo_path = ASSETS_DIR / "lvl_logo.png"
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"About {APP_NAME}")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        if logo_path.exists():
+            pix = QtGui.QPixmap(str(logo_path)).scaledToWidth(
+                160, QtCore.Qt.TransformationMode.SmoothTransformation
+                if hasattr(QtCore.Qt, "TransformationMode") else QtCore.Qt.SmoothTransformation
+            )
+            logo_label = QtWidgets.QLabel()
+            logo_label.setPixmap(pix)
+            logo_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter if hasattr(QtCore.Qt, "AlignmentFlag") else QtCore.Qt.AlignCenter
+            )
+            layout.addWidget(logo_label)
+
+        text = QtWidgets.QLabel(
+            f"<h2>{APP_NAME}</h2>"
+            f"<p>Version {APP_VERSION}</p>"
+            f"<p>First-arrival picking, layer analysis, and velocity/depth "
+            f"estimation for shallow seismic refraction surveys.</p>"
+        )
+        text.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter if hasattr(QtCore.Qt, "AlignmentFlag") else QtCore.Qt.AlignCenter
+        )
+        text.setWordWrap(True)
+        layout.addWidget(text)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok if hasattr(QtWidgets.QDialogButtonBox, "StandardButton")
+            else QtWidgets.QDialogButtonBox.Ok
+        )
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+
     def _reset_pick_layers(self):
         self.pick_layers = {"Mine": {}}
         self.layer_colors = {"Mine": "#d7191c"}
@@ -374,10 +458,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     # -- Project lifecycle (create / open / settings) -----------------------
 
     def _update_window_title(self):
-        if self.project is not None:
-            self.setWindowTitle(f"LVL Studio - {self.project.name}")
+        if self.project is not None and self.current_profile:
+            self.setWindowTitle(f"{APP_NAME} - {self.project.name} - {self.current_profile}")
+        elif self.project is not None:
+            self.setWindowTitle(f"{APP_NAME} - {self.project.name}")
         else:
-            self.setWindowTitle("LVL Studio - (no project open)")
+            self.setWindowTitle(f"{APP_NAME} - (no project open)")
 
     def _require_project(self) -> "pio.Project | None":
         """Return the active project, or None after warning the user.
@@ -398,6 +484,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def _set_project(self, project: "pio.Project"):
         self.project = project
         self.project.activate()
+        self.current_profile = None
         self._update_window_title()
         self._current_folder = None
         self.shots = []
@@ -473,7 +560,19 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 self, "Raw SEG2 data folder (contains one subfolder per profile)", start
             )
             if folder:
-                project.raw_folder = Path(folder).resolve()
+                chosen = Path(folder).resolve()
+                has_seg2_directly = any(chosen.glob("*.seg2")) or any(chosen.glob("*.SEG2"))
+                if has_seg2_directly and chosen.parent != chosen:
+                    use_parent = QtWidgets.QMessageBox.question(
+                        self, "Project Settings",
+                        f"'{chosen.name}' itself contains SEG2 files, which looks like a single "
+                        f"profile folder rather than the folder that holds ALL of your profile "
+                        f"folders.\n\nUse its parent instead ('{chosen.parent}'), so every profile "
+                        f"under it can be found?",
+                    ) == QtWidgets.QMessageBox.StandardButton.Yes
+                    if use_parent:
+                        chosen = chosen.parent
+                project.raw_folder = chosen
 
         if QtWidgets.QMessageBox.question(
             self, "Project Settings",
@@ -565,6 +664,14 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_clear_picks = QtWidgets.QPushButton("Clear Shot Picks")
         self.chk_layer_pick = QtWidgets.QCheckBox("Layer pick UI")
         self.chk_layer_pick.setChecked(False)
+        self.chk_auto_pick_v2 = QtWidgets.QCheckBox("Auto-pick with Picker V2")
+        self.chk_auto_pick_v2.setChecked(False)
+        self.chk_auto_pick_v2.setToolTip(
+            "Run Full Computation picks every shot automatically with the new\n"
+            "Picker Engine V2 (features -> likelihood -> coherence -> path\n"
+            "optimization -> confidence/quality) instead of opening the\n"
+            "interactive picker. Review low-confidence traces afterward."
+        )
         self.btn_run_compute = QtWidgets.QPushButton("Run Full Computation")
         self.btn_run_analysis = QtWidgets.QPushButton("Run Interactive Analysis")
 
@@ -713,6 +820,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         cmp_form = QtWidgets.QFormLayout(page_compute)
         cmp_form.setContentsMargins(6, 6, 6, 6)
         cmp_form.addRow(self.chk_layer_pick)
+        cmp_form.addRow(self.chk_auto_pick_v2)
         cmp_form.addRow(self.btn_run_analysis)
         cmp_form.addRow(self.btn_run_compute)
 
@@ -843,6 +951,10 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         act_project_settings.triggered.connect(lambda: self._edit_project_settings_dialog())
         menu_file.addAction(act_project_settings)
 
+        act_add_geometry = QAction("Add Geometry File(s)...", self)
+        act_add_geometry.triggered.connect(self._add_geometry_files_dialog)
+        menu_file.addAction(act_add_geometry)
+
         menu_file.addSeparator()
         act_open = QAction("Open SEG2 Folder", self)
         act_open.triggered.connect(self.open_folder)
@@ -899,6 +1011,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         act_next.triggered.connect(self.next_shot)
         nav_menu.addAction(act_next)
 
+        menu_help = self.menuBar().addMenu("Help")
+        act_about = QAction(f"About {APP_NAME}", self)
+        act_about.triggered.connect(self._show_about_dialog)
+        menu_help.addAction(act_about)
+
     def _on_view_settings_changed(self):
         self.settings.clip_pct = float(self.spin_clip.value())
         self.settings.max_traces_render = int(self.spin_max_tr.value())
@@ -933,10 +1050,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.settings.pick_order = self.cmb_pick_order.currentText().strip().upper()
         self.settings.manual_snap_win_ms = float(self.spin_manual_snap.value())
         self._render_current()
-
-    def _backend(self):
-        import lvl_refraction as lr
-        return lr
 
     def _on_geometry_changed(self, text: str):
         t = str(text).strip().lower()
@@ -996,12 +1109,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
     def _nearest_geom_by_span(self, span: float, margin: float | None = None) -> int | None:
         """Return known geometry type whose spread span is closest to `span` (within margin)."""
-        lr = self._backend()
         best = None
         best_diff = 1e18
-        for gt in sorted(getattr(lr, "GEOM_FILES", {100: None, 200: None}).keys()):
+        for gt in sorted(GEOM_FILES.keys()):
             try:
-                r = np.asarray(lr.load_geometry(int(gt)), dtype=float)
+                r = np.asarray(load_geometry(int(gt)), dtype=float)
             except Exception:
                 continue
             gs = abs(float(r[-1] - r[0]))
@@ -1022,14 +1134,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 span = abs(float(self._custom_geom_positions[-1] - self._custom_geom_positions[0]))
                 return self._nearest_geom_by_span(span)
             return None
-        lr = self._backend()
         # 1) LVL coordinate workbook distance -> nearest geometry within ~10 m.
         try:
             profile = self._profile_name_from_open_folder()
             if profile:
                 geometry_paths = [str(p) for p in self._discover_geometry_excels()]
                 if geometry_paths:
-                    res = lr.load_profile_geometry_from_excels(profile_name=profile, excel_paths=geometry_paths)
+                    res = load_profile_geometry_from_excels(profile_name=profile, excel_paths=geometry_paths)
                     length = res[0] if res else None
                     if length and float(length) > 0.0:
                         gt = self._nearest_geom_by_span(float(length), margin=10.0)
@@ -1039,7 +1150,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             pass
         # 2) SEG2 receiver span inference.
         try:
-            geom, _length = lr.infer_geometry_from_seg2_file(shot.source_file)
+            geom, _length = infer_geometry_from_seg2_file(shot.source_file)
             if geom in (100, 200):
                 return int(geom)
         except Exception:
@@ -1049,7 +1160,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             best = None
             best_diff = 1e18
             for gt in (100, 200):
-                sz = int(np.asarray(lr.load_geometry(gt)).size)
+                sz = int(np.asarray(load_geometry(gt)).size)
                 d = abs(sz - shot.n_traces)
                 if d < best_diff:
                     best_diff = d
@@ -1067,7 +1178,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             else:
                 gt = self._resolve_geom_type(shot)
                 if gt in (100, 200):
-                    recv = np.asarray(self._backend().load_geometry(int(gt)), dtype=float)
+                    recv = np.asarray(load_geometry(int(gt)), dtype=float)
         except Exception:
             recv = None
         if recv is None or recv.size < 2:
@@ -1115,7 +1226,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             return out
         if n == 3:
             try:
-                auto = self._backend().auto_shot_positions(rp)
+                auto = auto_shot_positions(rp)
                 return {0: float(auto[1]), 1: float(auto[2]), 2: float(auto[3])}
             except Exception:
                 pass
@@ -1166,13 +1277,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return float(sp)
 
     def _processed_trace_matrix(self, shot: ShotGather) -> np.ndarray:
-        lr = self._backend()
         data = np.asarray(shot.data, dtype=np.float32)
         filt = str(self.settings.filter_mode).lower()
         if filt == "butter":
             lo = min(self.settings.f2, self.settings.f3 - 0.1)
             hi = max(self.settings.f3, lo + 0.2)
-            data = lr.apply_butterworth_all_params(
+            data = apply_butterworth_all_params(
                 data,
                 shot.dt_ms / 1000.0,
                 low_hz=lo,
@@ -1182,11 +1292,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         elif filt == "ormsby":
             f1, f2, f3, f4 = self.settings.f1, self.settings.f2, self.settings.f3, self.settings.f4
             if f1 < f2 < f3 < f4:
-                data = lr.apply_ormsby_all_params(data, shot.dt_ms / 1000.0, f1=f1, f2=f2, f3=f3, f4=f4)
+                data = apply_ormsby_all_params(data, shot.dt_ms / 1000.0, f1=f1, f2=f2, f3=f3, f4=f4)
         elif filt == "cutpass":
             low_cut = min(self.settings.f2, self.settings.f3 - 0.1)
             high_cut = max(self.settings.f3, low_cut + 0.2)
-            data = lr.apply_cutpass_all_params(
+            data = apply_cutpass_all_params(
                 data,
                 shot.dt_ms / 1000.0,
                 low_cut_hz=low_cut,
@@ -1194,7 +1304,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 order=int(self.settings.butter_order),
             )
 
-        data = lr.apply_gain(
+        data = apply_gain(
             data,
             shot.dt_ms / 1000.0,
             mode=self.settings.gain_mode,
@@ -1206,13 +1316,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return np.asarray(data, dtype=np.float32)
 
     def _filtered_trace_matrix(self, shot: ShotGather) -> np.ndarray:
-        lr = self._backend()
         data = np.asarray(shot.data, dtype=np.float32)
         filt = str(self.settings.filter_mode).lower()
         if filt == "butter":
             lo = min(self.settings.f2, self.settings.f3 - 0.1)
             hi = max(self.settings.f3, lo + 0.2)
-            data = lr.apply_butterworth_all_params(
+            data = apply_butterworth_all_params(
                 data,
                 shot.dt_ms / 1000.0,
                 low_hz=lo,
@@ -1222,11 +1331,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         elif filt == "ormsby":
             f1, f2, f3, f4 = self.settings.f1, self.settings.f2, self.settings.f3, self.settings.f4
             if f1 < f2 < f3 < f4:
-                data = lr.apply_ormsby_all_params(data, shot.dt_ms / 1000.0, f1=f1, f2=f2, f3=f3, f4=f4)
+                data = apply_ormsby_all_params(data, shot.dt_ms / 1000.0, f1=f1, f2=f2, f3=f3, f4=f4)
         elif filt == "cutpass":
             low_cut = min(self.settings.f2, self.settings.f3 - 0.1)
             high_cut = max(self.settings.f3, low_cut + 0.2)
-            data = lr.apply_cutpass_all_params(
+            data = apply_cutpass_all_params(
                 data,
                 shot.dt_ms / 1000.0,
                 low_cut_hz=low_cut,
@@ -1238,9 +1347,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return np.asarray(data, dtype=np.float32)
 
     def _gain_trace_matrix(self, shot: ShotGather) -> np.ndarray:
-        lr = self._backend()
         data = self._filtered_trace_matrix(shot)
-        data = lr.apply_gain(
+        data = apply_gain(
             data,
             shot.dt_ms / 1000.0,
             mode=self.settings.gain_mode,
@@ -1261,7 +1369,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return fil
 
     def _snap_pick_time_ms(self, shot: ShotGather, trace_idx: int, click_t_ms: float) -> float:
-        lr = self._backend()
         mode = str(self.settings.auto_pick_mode).lower()
         dt_s = shot.dt_ms / 1000.0
         t0 = self._time_zero_ms(shot)
@@ -1280,7 +1387,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             return float(click_t_ms)
 
         if mode == "maxdiff_zero":
-            ts = lr._zero_crossing_from_extremum_samples(
+            ts = _zero_crossing_from_extremum_samples(
                 samples=tr,
                 dt_s=dt_s,
                 win_start_s=a,
@@ -1292,9 +1399,9 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 return float(click_t_ms)
             return float(t0 + 1000.0 * ts)
 
-        tro = lr.Trace(data=np.asarray(tr, dtype=np.float32))
+        tro = Trace(data=np.asarray(tr, dtype=np.float32))
         tro.stats.delta = float(dt_s)
-        _env, t_peak, t_onset = lr.hilbert_envelope_pick(
+        _env, t_peak, t_onset = hilbert_envelope_pick(
             trace=tro,
             win_start_s=a,
             win_end_s=b,
@@ -1337,7 +1444,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         if self.current_idx < 0 or self.current_idx >= len(self.shots):
             return
         shot = self.shots[self.current_idx]
-        lr = self._backend()
         prepared = self._gain_trace_matrix(shot)
         dt_s = shot.dt_ms / 1000.0
         n_samp = prepared.shape[1]
@@ -1374,7 +1480,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         elif mode == "maxdiff_zero":
             for i in range(prepared.shape[0]):
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
-                zt = lr._zero_crossing_from_extremum_samples(
+                zt = _zero_crossing_from_extremum_samples(
                     samples=prepared[i].astype(float),
                     dt_s=dt_s,
                     win_start_s=a,
@@ -1388,9 +1494,9 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         else:
             for i in range(prepared.shape[0]):
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
-                tr = lr.Trace(data=np.asarray(prepared[i], dtype=np.float32))
+                tr = Trace(data=np.asarray(prepared[i], dtype=np.float32))
                 tr.stats.delta = float(dt_s)
-                _env, peak_s, onset_s = lr.hilbert_envelope_pick(
+                _env, peak_s, onset_s = hilbert_envelope_pick(
                     trace=tr,
                     win_start_s=a,
                     win_end_s=b,
@@ -1499,7 +1605,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         if not self.shots:
             QtWidgets.QMessageBox.information(self, "Import Picks", "Open a SEG2 folder first.")
             return
-        start_dir = str(self._current_folder or LEGACY_IMPORT_PICKS_DIR if LEGACY_IMPORT_PICKS_DIR.exists() else Path.cwd())
+        default_dir = self._current_folder or (self.project.paths.picks_dir if self.project else None)
+        start_dir = str(default_dir if default_dir and Path(default_dir).exists() else Path.cwd())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Import picks file", start_dir,
             "Picks (*.txt *.json);;Text picks (*.txt);;JSON picks (*.json);;All files (*.*)",
@@ -1896,14 +2003,24 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         loaded_msg = ""
         profile_name = self._profile_name_from_open_folder()
+        self.current_profile = profile_name
+        self._update_window_title()
         if profile_name:
             n_loaded = self._autoload_picks(profile_name)
             if n_loaded:
                 loaded_msg = f" | resumed {n_loaded} shot picks from output/{profile_name}"
+            if self.project is not None:
+                self.project.register_profile(profile_name)
+                pio.save_project(self.project)
 
         if self.shots:
             self.shot_list.setCurrentRow(0)
-            self.statusBar().showMessage(f"Loaded {len(self.shots)} shots from {folder}{loaded_msg}")
+            found_msg = ""
+            if profile_name:
+                n_geo = len(self._discover_geometry_excels())
+                n_rep = len(self._discover_report_paths())
+                found_msg = f" | geometry files: {n_geo}, field reports: {n_rep}"
+            self.statusBar().showMessage(f"Loaded {len(self.shots)} shots from {folder}{loaded_msg}{found_msg}")
         else:
             self.current_idx = -1
             self.summary_table.setRowCount(0)
@@ -1994,21 +2111,31 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         )
 
     def _profile_name_from_open_folder(self) -> str | None:
-        if self._current_folder is None or self.project is None:
-            return None
-        raw_folder = self.project.raw_folder
-        if raw_folder is None:
+        """The profile name for the currently-open SEG2 folder.
+
+        A folder counts as "a profile folder" if it directly contains
+        SEG2 files - this does NOT require it to be an immediate child of
+        `project.raw_folder`. That used to be a strict requirement, which
+        broke the moment `raw_folder` was set to a single profile's
+        folder instead of the parent containing every profile (an easy
+        mistake in the "Project Settings" dialog): opening that same
+        profile folder no longer satisfied `folder.parent == raw_folder`,
+        silently disabling picks/geometry/metadata discovery. Using the
+        folder's own contents instead of its position in the tree makes
+        this robust regardless of how raw_folder was set, or even if it
+        isn't set at all.
+        """
+        if self._current_folder is None:
             return None
         folder = self._current_folder.resolve()
         try:
-            if folder.parent.resolve() == raw_folder.resolve():
-                return folder.name
+            has_seg2 = any(folder.glob("*.seg2")) or any(folder.glob("*.SEG2"))
         except Exception:
             return None
-        return None
+        return folder.name if has_seg2 else None
 
     def _export_picks_to_lvl_refraction_session(self, profile_name: str):
-        from lvl_refraction import save_session_picks_json
+        # save_session_picks_json is imported at module level from src.io.pick_reader
 
         all_picks: dict[int, dict[int, float]] = {}
         for idx in range(len(self.shots)):
@@ -2023,7 +2150,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Computation Setup",
-                "Open a profile folder under lvl/data/<profile> to run full computation with lvl_refraction backend.",
+                "Open a profile folder under the project's raw data folder to run full computation with the lvl_refraction backend.",
             )
             return
         if not self.shots:
@@ -2033,11 +2160,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         geom_txt = self.cmb_geom_view.currentText().strip().lower()
         geom_override = 100 if geom_txt == "100" else 200 if geom_txt == "200" else None
         enable_layer_pick = bool(self.chk_layer_pick.isChecked())
+        auto_pick_v2 = bool(self.chk_auto_pick_v2.isChecked())
 
         try:
             self._export_picks_to_lvl_refraction_session(profile_name)
 
-            from lvl_refraction import process_profile, discover_field_report_excels
+            from src.refraction.pipeline import process_profile
 
             metadata_folder = self.project.metadata_folder if self.project else None
             report_paths = (
@@ -2067,13 +2195,16 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 enable_layer_pick=enable_layer_pick,
                 control_file=None,
                 show_plot_controls=True,
+                raw_dir=self.project.raw_folder if self.project else None,
+                auto_pick=auto_pick_v2,
             )
 
-            self.statusBar().showMessage(f"Computation finished for {profile_name}. See lvl/data/results/reports/{profile_name}")
+            reports_hint = self.project.paths.relative(self.project.paths.reports_dir_for(profile_name))
+            self.statusBar().showMessage(f"Computation finished for {profile_name}. See {reports_hint}")
             QtWidgets.QMessageBox.information(
                 self,
                 "Computation Finished",
-                f"Full computation finished for profile '{profile_name}'.\nOutputs are in lvl/data/results/reports/{profile_name}.",
+                f"Full computation finished for profile '{profile_name}'.\nOutputs are in {reports_hint}.",
             )
         except Exception as exc:
             tb = traceback.format_exc(limit=8)
@@ -2110,8 +2241,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return out
 
     def _discover_report_paths(self) -> list[Path]:
-        """Field-report Excel files, searching data/ and data/<profile> like the script."""
-        lr = self._backend()
+        """Field-report Excel files, searched under the project's metadata/geometry folders."""
         out: list[Path] = []
         seen: set[str] = set()
         search_dirs = [d for d in (
@@ -2122,7 +2252,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             search_dirs.append(self._current_folder)
         for d in search_dirs:
             try:
-                for p in lr.discover_field_report_excels(d):
+                for p in discover_field_report_excels(d):
                     key = os.path.normcase(str(Path(p).resolve()))
                     if key not in seen:
                         seen.add(key)
@@ -2133,14 +2263,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
     def _load_perp_overrides(self, profile_name: str) -> tuple[dict, dict, list[str]]:
         """Load per-shot PO (and inline shift) from field reports; returns (perp, shift, sources)."""
-        lr = self._backend()
         ffid_by_shot = {idx + 1: int(self.shots[idx].ffid) for idx in range(len(self.shots))}
         perp: dict[int, float] = {}
         shift: dict[int, float] = {}
         sources: list[str] = []
         for rp in self._discover_report_paths():
             try:
-                po_map, sh_map = lr.load_profile_offsets_from_excel(
+                po_map, sh_map = load_profile_offsets_from_excel(
                     path=rp,
                     profile_name=profile_name,
                     ffid_by_shot=ffid_by_shot,
@@ -2163,7 +2292,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Analysis", "No picks available. Pick arrivals first.")
             return
 
-        lr = self._backend()
         recv_positions = self._receiver_positions_for_shot(self.shots[0])
         shots_info = self._derive_shot_positions(recv_positions)
         shot_label_pos = {sid: pos for sid, pos in shots_info}
@@ -2182,7 +2310,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No field-report PO found; using PO=0.0 (editable in the PO window).")
 
         try:
-            wf = lr.AnalysisWorkflow(
+            wf = AnalysisWorkflow(
                 profile_name=profile,
                 cfg=cfg,
                 shots_info=shots_info,
@@ -2197,7 +2325,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             out = wf.run()
             layer_results = out.get("layer_results", {})
             corrected_by_shot = out.get("corrected_by_shot", {})
-            avg = lr.compute_layer_averages(layer_results, shot_label_pos)
+            avg = compute_layer_averages(layer_results, shot_label_pos)
 
             self._last_analysis = {
                 "profile": profile,
@@ -2248,17 +2376,16 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         if not self._last_analysis:
             QtWidgets.QMessageBox.information(self, "Save Excel", "Run Interactive Analysis first.")
             return
-        lr = self._backend()
         a = self._last_analysis
         try:
-            analysis = lr.build_analysis_from_layers(a["corrected_by_shot"], a["layer_results"])
+            analysis = build_analysis_from_layers(a["corrected_by_shot"], a["layer_results"])
             project = self._require_project()
             if project is None:
                 return
             geometry_paths = [str(p) for p in self._discover_geometry_excels()]
             out_dir = project.paths.velocity_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            path = lr.export_velocity_summary_excel(
+            path = export_velocity_summary_excel(
                 profile_name=a["profile"],
                 cfg=a["cfg"],
                 recv_positions=a["recv_positions"],
@@ -2275,16 +2402,62 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save Excel Error", f"{exc}\n\n{tb}")
 
     def _discover_geometry_excels(self) -> list[Path]:
+        """Every geometry/coordinate file available for the current project.
+
+        Combines (1) files the user explicitly uploaded via 'Add Geometry
+        File(s)...' - always included, any name/location - with (2) files
+        auto-discovered under the project's geometry folder that follow
+        the survey-table naming convention ('LVL*'). Manual files are
+        listed first so they win ties in the profile-matching functions
+        in `src.utils.geometry` (first sufficiently-good match wins).
+        """
         out: list[Path] = []
+        seen: set[str] = set()
+
+        def _add(p: Path):
+            key = os.path.normcase(str(Path(p).resolve()))
+            if key not in seen and Path(p).exists():
+                seen.add(key)
+                out.append(Path(p))
+
+        if self.project is not None:
+            for p in self.project.manual_geometry_files:
+                _add(p)
+
         geometry_folder = self.project.geometry_folder if self.project else None
-        if geometry_folder is None or not geometry_folder.exists():
-            return out
-        for p in geometry_folder.glob("LVL*.xls*"):
-            name = p.name.lower()
-            if "field_report" in name or "fieldreport" in name:
-                continue
-            out.append(p)
+        if geometry_folder is not None and geometry_folder.exists():
+            for pattern in ("LVL*.xls*", "LVL*.csv", "LVL*.txt", "LVL*.dat"):
+                for p in geometry_folder.glob(pattern):
+                    name = p.name.lower()
+                    if "field_report" in name or "fieldreport" in name:
+                        continue
+                    _add(p)
         return out
+
+    def _add_geometry_files_dialog(self):
+        """File > Add Geometry File(s)...: manually register geometry/
+        coordinate files (xlsx/xls/csv/txt/dat) for profile auto-detection,
+        for cases where they don't live under the project's geometry
+        folder or don't follow the 'LVL*' naming convention.
+        """
+        project = self._require_project()
+        if project is None:
+            return
+        start_dir = str(project.geometry_folder or Path.cwd())
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add Geometry/Coordinate File(s)", start_dir,
+            "Geometry files (*.xlsx *.xls *.csv *.txt *.dat);;All files (*)",
+        )
+        if not paths:
+            return
+        added = 0
+        for p in paths:
+            if project.add_manual_geometry_file(Path(p)):
+                added += 1
+        pio.save_project(project)
+        self.statusBar().showMessage(
+            f"Added {added} geometry file(s) ({len(project.manual_geometry_files)} total registered)."
+        )
 
     def _load_seg2_folder(self, folder: Path) -> list[ShotGather]:
         files_raw = list(folder.glob("*.seg2")) + list(folder.glob("*.SEG2"))

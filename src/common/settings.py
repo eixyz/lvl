@@ -9,6 +9,14 @@ from __future__ import annotations
 from src.common.paths import GEOM_TEMPLATES_DIR
 
 # ---------------------------------------------------------------------------
+# App identity - used in window titles, About dialogs, and CLI banners.
+# Bump APP_VERSION when the picker engine or project format changes in a
+# way users should notice.
+# ---------------------------------------------------------------------------
+APP_NAME: str = "LVL Studio"
+APP_VERSION: str = "2.0.0"
+
+# ---------------------------------------------------------------------------
 # Geometry files:
 # Map geometry type -> receiver geometry definition file.
 # These are bundled app-level templates (fixed receiver spacings), not

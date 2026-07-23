@@ -1,10 +1,37 @@
 {
   "name": "LVL_Erfurt",
-  "raw_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\raw\\150",
+  "raw_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\raw",
   "geometry_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\geometry",
   "metadata_folder": "D:\\Daten\\seismic\\lvl\\data\\input\\metadata",
-  "profiles": [],
+  "manual_geometry_files": [
+    "D:\\Daten\\seismic\\lvl\\data\\input\\geometry\\geometry100.txt",
+    "D:\\Daten\\seismic\\lvl\\data\\input\\geometry\\geometry200.txt",
+    "D:\\Daten\\seismic\\lvl\\data\\input\\geometry\\LVL XXX_05-06-26.xlsx"
+  ],
+  "profiles": [
+    "101",
+    "110",
+    "111",
+    "120",
+    "121",
+    "125",
+    "131",
+    "141",
+    "150",
+    "151",
+    "155",
+    "161",
+    "171",
+    "181",
+    "191",
+    "214_A",
+    "415_B",
+    "521",
+    "601",
+    "711",
+    "721"
+  ],
   "notes": "",
   "created": "2026-07-20T10:19:52+00:00",
-  "modified": "2026-07-21T15:25:43+00:00"
+  "modified": "2026-07-23T14:12:56+00:00"
 }

@@ -37,23 +37,24 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 PROJECTS_ROOT = APP_ROOT / "projects"
 
 # -----------------------------------------------------------------------------
-# Legacy / bundled application resources
+# Bundled application resources
 # -----------------------------------------------------------------------------
-# `data/` is the flat layout this app used before the project system
-# existed. It is kept only for:
-#   - bundled default receiver-geometry templates (geometry100.txt / 200.txt)
-#   - the bundled example dataset referenced from the docs
-# It is NOT where project output goes anymore - see ProjectPaths below.
+# Fixed, read-only assets shipped with the app itself - not part of any
+# user project, and not the old flat `data/` layout (fully retired: every
+# project now owns its own processing/results folders, and its raw/
+# geometry/metadata locations are remembered per-project in project.json,
+# see src.io.project_io.Project).
 
-LEGACY_DATA_DIR = APP_ROOT / "data"
-LEGACY_INPUT_DIR = LEGACY_DATA_DIR / "input"
+RESOURCES_DIR = APP_ROOT / "resources"
 
-GEOM_TEMPLATES_DIR = LEGACY_INPUT_DIR / "geometry"   # geometry100.txt / geometry200.txt
-LEGACY_METADATA_DIR = LEGACY_INPUT_DIR / "metadata"
-LEGACY_RAW_DIR = LEGACY_INPUT_DIR / "raw"
-LEGACY_EXTERNAL_DIR = LEGACY_DATA_DIR / "external"
-LEGACY_EXAMPLES_DIR = LEGACY_DATA_DIR / "examples"
-LEGACY_IMPORT_PICKS_DIR = LEGACY_EXAMPLES_DIR / "picks"
+# Default receiver-geometry templates (fixed spacings), e.g. geometry100.txt
+# = 100 m spread, geometry200.txt = 200 m spread. A project's own survey-
+# specific coordinates (per-station X/Y/Z) are a completely different
+# thing - see Project.geometry_folder / Project.manual_geometry_files.
+GEOM_TEMPLATES_DIR = RESOURCES_DIR / "geometry_templates"
+
+# App icon/logo assets (window icon, header banner, About dialog, ...).
+ASSETS_DIR = RESOURCES_DIR / "assets"
 
 # -----------------------------------------------------------------------------
 # Project name validation
@@ -243,13 +244,9 @@ def clear_active_project() -> None:
 __all__ = [
     "APP_ROOT",
     "PROJECTS_ROOT",
-    "LEGACY_DATA_DIR",
+    "RESOURCES_DIR",
     "GEOM_TEMPLATES_DIR",
-    "LEGACY_METADATA_DIR",
-    "LEGACY_RAW_DIR",
-    "LEGACY_EXTERNAL_DIR",
-    "LEGACY_EXAMPLES_DIR",
-    "LEGACY_IMPORT_PICKS_DIR",
+    "ASSETS_DIR",
     "PROJECT_FILE_NAME",
     "ProjectPaths",
     "sanitize_project_name",

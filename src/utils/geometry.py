@@ -1,6 +1,7 @@
 """Geometry, profile discovery, and field-report/coordinate Excel parsing utilities."""
 from __future__ import annotations
 
+import csv
 import datetime
 import math
 from pathlib import Path
@@ -64,6 +65,51 @@ def _excel_col_to_index(col: str) -> int:
     for ch in s:
         out = out * 26 + (ord(ch) - ord("A") + 1)
     return out - 1
+
+def _read_geometry_table(path: Path) -> dict:
+    """Read a geometry/coordinate table regardless of file format.
+
+    Returns {sheet_name: DataFrame} for a uniform interface: Excel files
+    may have several sheets; a plain-text file (.txt/.dat/.csv) is always
+    treated as a single sheet with its delimiter auto-detected (comma,
+    semicolon, tab, or whitespace).
+
+    This is what lets a manually-uploaded geometry file (any of
+    .xlsx/.xls/.csv/.txt/.dat) be searched the exact same way as an
+    auto-discovered "LVL*.xlsx" survey table - same profile/station/X/Y/Z
+    column-detection logic in `_find_station_xyz_columns` either way.
+    """
+    suffix = Path(path).suffix.lower()
+
+    if suffix in (".xlsx", ".xlsm", ".xls"):
+        try:
+            return pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+        except Exception:
+            engine = "xlrd" if suffix == ".xls" else "openpyxl"
+            return pd.read_excel(path, sheet_name=None, header=None, dtype=object, engine=engine)
+
+    # Plain-text table: sniff the delimiter rather than assuming one.
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    sample = "\n".join(text.splitlines()[:20])
+    delimiter = ","
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t ").delimiter
+    except Exception:
+        if "\t" in sample:
+            delimiter = "\t"
+        elif ";" in sample:
+            delimiter = ";"
+        elif "," in sample:
+            delimiter = ","
+        else:
+            delimiter = r"\s+"
+
+    df = pd.read_csv(
+        path, sep=delimiter, header=None, dtype=object, engine="python",
+        skip_blank_lines=True,
+    )
+    return {"Sheet1": df}
+
 
 def _normalize_profile_token(value: Any) -> str:
     """
@@ -210,7 +256,7 @@ def load_midpoint_xyz_from_geometry_excels(profile_name: str,
 
     for path in excel_paths:
         try:
-            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+            sheets = _read_geometry_table(path)
         except Exception:
             continue
         for _sheet_name, df in sheets.items():
@@ -335,7 +381,7 @@ def load_profile_geometry_from_excels(profile_name: str,
 
     for path in excel_paths:
         try:
-            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+            sheets = _read_geometry_table(path)
         except Exception:
             continue
 

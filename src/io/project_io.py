@@ -60,6 +60,7 @@ class Project:
     raw_folder: Path | None = None          # folder of SEG2 subfolders, one per profile
     geometry_folder: Path | None = None     # coordinate/geometry workbooks & shapefiles
     metadata_folder: Path | None = None     # field-report workbooks
+    manual_geometry_files: list[Path] = field(default_factory=list)  # explicitly uploaded geometry/coordinate files (any profile)
     profiles: list[str] = field(default_factory=list)
     notes: str = ""
     created: str = field(default_factory=_now)
@@ -79,6 +80,7 @@ class Project:
             "raw_folder": _to_str(self.raw_folder),
             "geometry_folder": _to_str(self.geometry_folder),
             "metadata_folder": _to_str(self.metadata_folder),
+            "manual_geometry_files": [str(p) for p in self.manual_geometry_files],
             "profiles": list(self.profiles),
             "notes": self.notes,
             "created": self.created,
@@ -93,6 +95,7 @@ class Project:
             raw_folder=_to_path(data.get("raw_folder")),
             geometry_folder=_to_path(data.get("geometry_folder")),
             metadata_folder=_to_path(data.get("metadata_folder")),
+            manual_geometry_files=[Path(p) for p in (data.get("manual_geometry_files") or [])],
             profiles=list(data.get("profiles") or []),
             notes=data.get("notes", ""),
             created=data.get("created") or _now(),
@@ -104,6 +107,17 @@ class Project:
         if profile_name not in self.profiles:
             self.profiles.append(profile_name)
             self.profiles.sort()
+
+    def add_manual_geometry_file(self, path: Path) -> bool:
+        """Register an explicitly-uploaded geometry/coordinate file.
+
+        Returns False (no-op) if that exact path is already registered.
+        """
+        p = Path(path).resolve()
+        if any(Path(existing).resolve() == p for existing in self.manual_geometry_files):
+            return False
+        self.manual_geometry_files.append(p)
+        return True
 
     def activate(self) -> ProjectPaths:
         """Make this project the app-wide active project (see paths.py)."""
