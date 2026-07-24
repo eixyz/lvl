@@ -56,7 +56,10 @@ class FirstBreakPicker:
     def compute_coherence(self, data: Any, trace_idx: int, radius: int | None = None,
                           window: int = 21) -> np.ndarray:
         radius = self.settings.coherence_radius if radius is None else radius
-        raw = coherence.compute_trace_coherence(data, trace_idx, radius=radius, window=window)
+        raw = coherence.compute_trace_coherence(
+            data, trace_idx, radius=radius, window=window,
+            align=self.settings.coherence_align, max_shift=self.settings.coherence_max_shift,
+        )
         return coherence.coherence_weight(raw)
 
     def optimize(self, probabilities: list[np.ndarray], **kwargs) -> tuple[list[int | None], float]:

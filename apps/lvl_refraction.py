@@ -2619,7 +2619,10 @@ from src.refraction.pipeline import process_profile
 
 def main():
     """CLI entry point: parse arguments, resolve targets, and process profiles."""
+    from src.common.logging_setup import setup_file_logging
+    log_path = setup_file_logging("lvl_refraction")
     print(f"{APP_NAME} (refraction engine) v{APP_VERSION}")
+    print(f"Logging to: {log_path}")
     parser = argparse.ArgumentParser(
         prog="lvl_refraction.py",
         description="LVL refraction seismic: interactive picking + analysis.",

@@ -54,6 +54,100 @@ def velocity_directory() -> Path:
     p = _project().velocity_dir
     return _project().ensure_dir(p)
 
+
+def export_processing_report(
+    profile_name: str,
+    cfg: dict,
+    analysis: dict | None = None,
+    layer_results: dict | None = None,
+    perp_by_shot: dict | None = None,
+    inline_shift_by_shot: dict | None = None,
+    po_sources: list | None = None,
+    geometry_paths: list | None = None,
+    report_paths: list | None = None,
+    manual_geometry_paths: list | None = None,
+    raw_folder: Path | str | None = None,
+    picker_method: str | None = None,
+    output_files: list | None = None,
+    filename_suffix: str = "",
+) -> Path:
+    """Write a human-readable processing_report.md for one profile.
+
+    This exists purely for traceability/handover: which geometry file,
+    field-report file, and coordinate file were actually used to process
+    this profile, with what parameters, producing what results - so
+    someone looking at `results/reports/<profile>/` six months from now
+    (or a colleague who didn't run the processing themselves) can see
+    exactly what went into it without re-deriving it from picks.json.
+    """
+    out_dir = report_directory(profile_name)
+    out_path = out_dir / f"{profile_name}_processing_report{filename_suffix}.md"
+
+    def _fmt_paths(paths) -> str:
+        paths = [p for p in (paths or []) if p]
+        if not paths:
+            return "(none)"
+        return "\n".join(f"- `{p}`" for p in paths)
+
+    def _fmt_by_shot(d: dict, unit: str) -> str:
+        if not d:
+            return "(none set - default 0.0)"
+        return ", ".join(f"S{k}={float(v):.2f}{unit}" for k, v in sorted(d.items()))
+
+    avg = compute_layer_averages(layer_results or {}, {}) if layer_results else {}
+
+    def g(section: str, key: str = "avg") -> float:
+        return float((avg.get(section, {}) or {}).get(key, 0.0) or 0.0)
+
+    lines = [
+        f"# Processing report - profile {profile_name}",
+        "",
+        f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"Picker method: {picker_method or '(not recorded)'}",
+        "",
+        "## Parameters",
+        f"- Geometry type: {cfg.get('geom', '?')}",
+        f"- Line number: {cfg.get('line_no', profile_name)}",
+        "",
+        "## Input files used",
+        f"Raw SEG2 folder: `{raw_folder}`" if raw_folder else "Raw SEG2 folder: (not recorded)",
+        "",
+        "Geometry/coordinate files (auto-discovered + manually uploaded):",
+        _fmt_paths(geometry_paths),
+        "",
+        "Manually uploaded geometry files (subset of the above, always searched first):",
+        _fmt_paths(manual_geometry_paths),
+        "",
+        "Field-report files (perpendicular-offset source):",
+        _fmt_paths(report_paths),
+        "",
+        "## Perpendicular offset (PO) by shot",
+        _fmt_by_shot(perp_by_shot, "m"),
+        f"Source: {', '.join(po_sources) if po_sources else 'none (PO=0.0)'}",
+        "",
+        "## Inline shift by shot",
+        _fmt_by_shot(inline_shift_by_shot, "m"),
+        "",
+    ]
+
+    if avg:
+        lines += [
+            "## Results summary",
+            f"- V0 avg: {g('V0'):.1f} m/s",
+            f"- V1 avg: {g('V1'):.1f} m/s",
+            f"- V2 avg: {g('V2'):.1f} m/s",
+            f"- H0 depth: {float(avg.get('h1_m', 0.0) or 0.0):.2f} m",
+            f"- H1 depth: {float(avg.get('h2_m', 0.0) or 0.0):.2f} m",
+            "",
+        ]
+
+    if output_files:
+        lines += ["## Output files written this run"] + [f"- `{p}`" for p in output_files] + [""]
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"  processing_report -> {_project().relative(out_path)}")
+    return out_path
+
 def export_velocity_summary_excel(profile_name: str,
                                   cfg: dict,
                                   recv_positions: Any,

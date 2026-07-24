@@ -1,1 +1,0 @@
-# Butterworth, Ormsby, AGC, normalization

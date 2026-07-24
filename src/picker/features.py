@@ -92,6 +92,14 @@ def compute_aic(samples: Any) -> np.ndarray:
     """
     Compute AIC (Akaike Information Criterion) function for a 1D signal.
 
+    Classic Maeda/Akaike-picker formula:
+        AIC[k] = k * log(var(x[:k])) + (n-k) * log(var(x[k:]))
+
+    Computed via cumulative sums so each expanding-window variance is
+    O(1) instead of recomputing `np.var` from scratch at every k (which
+    made this O(n^2) - the dominant cost in the whole picking pipeline
+    on real, thousands-of-samples-long traces).
+
     Parameters
     ----------
     samples : array-like
@@ -100,20 +108,33 @@ def compute_aic(samples: Any) -> np.ndarray:
     Returns
     -------
     aic : ndarray
-        AIC values for each sample in the input signal.
+        AIC values for each sample in the input signal (0 at the edges,
+        matching the original loop's range(1, n-1)).
     """
-    x = np.asarray(samples, dtype=float)
+    x = np.asarray(samples, dtype=np.float64)
     n = x.size
     if n < 2:
         return np.asarray([], dtype=np.float32)
+    if n < 3:
+        return np.zeros(n, dtype=np.float32)
 
-    aic = np.zeros(n, dtype=np.float32)
-    for k in range(1, n - 1):
-        var1 = np.var(x[:k]) if k > 0 else 0.0
-        var2 = np.var(x[k:]) if k < n else 0.0
-        aic[k] = k * np.log(var1 + 1e-10) + (n - k) * np.log(var2 + 1e-10)
+    cs1 = np.concatenate(([0.0], np.cumsum(x)))
+    cs2 = np.concatenate(([0.0], np.cumsum(x * x)))
 
-    return aic 
+    k = np.arange(1, n - 1)
+    sum1, sum1_sq = cs1[k], cs2[k]
+    mean1 = sum1 / k
+    var1 = np.maximum(sum1_sq / k - mean1 ** 2, 0.0)
+
+    n_k = n - k
+    sum2 = cs1[n] - cs1[k]
+    sum2_sq = cs2[n] - cs2[k]
+    mean2 = sum2 / n_k
+    var2 = np.maximum(sum2_sq / n_k - mean2 ** 2, 0.0)
+
+    aic = np.zeros(n, dtype=np.float64)
+    aic[k] = k * np.log(var1 + 1e-10) + n_k * np.log(var2 + 1e-10)
+    return aic.astype(np.float32)
 
 def compute_gradient(samples: Any) -> np.ndarray:
     """

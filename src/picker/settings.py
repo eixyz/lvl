@@ -40,6 +40,8 @@ class PickerSettings:
     hilbert_onset_pct: float = HILBERT_ONSET_PCT
 
     coherence_radius: int = 2             # number of neighbouring traces each side
+    coherence_align: bool = True          # shift-align neighbours before semblance (real moveout)
+    coherence_max_shift: int = 30         # samples; cap on the alignment search
     smoothness_penalty: float = 0.1       # dynamic-programming path smoothness cost
     jump_penalty: float = 0.2             # cost for large sample-to-sample pick jumps
     minimum_confidence: float = 0.3       # picks below this are flagged MANUAL_REVIEW

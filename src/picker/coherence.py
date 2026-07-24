@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from src.picker.likelihood import normalize_probability
 
@@ -144,15 +145,27 @@ def compute_trace_coherence(
     trace_idx: int,
     radius: int = 2,
     window: int = 21,
+    align: bool = True,
+    max_shift: int = 30,
 ) -> np.ndarray:
     """Per-sample semblance curve for one trace against its neighbours.
 
     For every sample, takes a short window centred on it from
     `trace_idx` and from each neighbour within `radius`, and computes
-    their semblance. Assumes neighbours are close enough that first-break
-    moveout across the window is small (true for reasonable receiver
-    spacing); for wide spacing, align neighbours first via
-    `cross_correlation` / `stack_neighbours(shift_samples=...)`.
+    their semblance.
+
+    If `align=True` (default), each neighbour is first shifted by a
+    constant lag - found once via whole-trace `cross_correlation` against
+    `trace_idx` - before computing semblance. This matters a lot on real
+    data: real first-break moveout across even 2-3 receiver spacings is
+    often several samples to tens of samples, and comparing UNALIGNED
+    windows means comparing genuinely different parts of the waveform
+    across traces, which actively degrades the fused pick rather than
+    reinforcing it (this was the likely cause of Picker V2 underperforming
+    a plain single-feature picker on real, noisier data - see picker
+    module docs). The alignment here is a single constant shift per
+    neighbour (not time-varying), which is an approximation, but is far
+    better than none.
 
     Returns a curve normalized to [0, 1], same length as the trace.
     """
@@ -172,13 +185,31 @@ def compute_trace_coherence(
         win += 1
     half = win // 2
 
-    coh = np.zeros(n_samples, dtype=np.float64)
-    block = d[neighbours]  # (n_neighbours, n_samples)
+    block = d[neighbours].copy()  # (n_neighbours, n_samples)
+
+    if align:
+        ref = d[trace_idx]
+        for row, nb_idx in enumerate(neighbours):
+            if nb_idx == trace_idx:
+                continue
+            lag, score = cross_correlation(ref, d[nb_idx], max_lag=max_shift)
+            # Only trust the alignment if it's a genuinely good match;
+            # a weak/noisy correlation is more likely to misalign than help.
+            if score > 0.3 and lag != 0:
+                block[row] = np.roll(block[row], lag)
+
     padded = np.pad(block, ((0, 0), (half, half)), mode="reflect")
 
-    for j in range(n_samples):
-        windows = padded[:, j:j + win]
-        coh[j] = semblance(windows)
+    # Vectorized semblance for every sample at once, instead of a Python
+    # loop calling semblance() per sample (that loop is what made this
+    # hang on real traces with thousands of samples - O(n_samples) Python-
+    # level calls per trace, times every trace in the gather).
+    windows_all = sliding_window_view(padded, win, axis=1)  # (n_neighbours, n_samples, win)
+    stack = np.sum(windows_all, axis=0)                     # (n_samples, win)
+    num = np.sum(stack ** 2, axis=1)                         # (n_samples,)
+    den = float(len(neighbours)) * np.sum(windows_all ** 2, axis=(0, 2))  # (n_samples,)
+    den = np.where(den > 1e-20, den, 1e-20)
+    coh = np.clip(num / den, 0.0, 1.0)
 
     return normalize_probability(coh)
 
@@ -232,6 +263,8 @@ def compute_coherence_probability(
     window: int = 21,
     weight: float = 0.75,
     sharpen: float = 1.0,
+    align: bool = True,
+    max_shift: int = 30,
 ) -> list[np.ndarray]:
     """Full per-gather entry point.
 
@@ -245,6 +278,10 @@ def compute_coherence_probability(
         One fused likelihood curve per trace (from
         `src.picker.likelihood.compute_arrival_probability`), same order
         as `data`'s rows.
+    align : bool, optional
+        Shift-align neighbours before computing semblance (see
+        `compute_trace_coherence`) - matters a lot on real data with
+        real moveout across the receiver spread.
 
     Returns
     -------
@@ -260,7 +297,7 @@ def compute_coherence_probability(
 
     updated: list[np.ndarray] = []
     for i in range(n_traces):
-        coh = compute_trace_coherence(d, i, radius=radius, window=window)
+        coh = compute_trace_coherence(d, i, radius=radius, window=window, align=align, max_shift=max_shift)
         coh = coherence_weight(coh, sharpen=sharpen)
         updated.append(update_probability(probabilities[i], coh, weight=weight))
     return updated

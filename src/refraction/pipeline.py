@@ -54,6 +54,7 @@ from src.refraction.layer_analysis import build_corrected_pick_data, build_analy
 from src.io.exporters import (
     export_velocity_summary_excel, export_excel, export_picks_txt,
     export_tx_plot, export_arrivals_observed_computed_plot, export_layer_fit_rms_plot,
+    export_processing_report,
 )
 
 
@@ -138,6 +139,94 @@ class AnalysisWorkflow:
             "corrected_by_shot": self.corrected_by_shot,
             "layer_results": self.layer_results,
         }
+
+
+def export_full_analysis(
+    profile_name: str,
+    cfg: dict,
+    shots_info: list,
+    recv_positions: Any,
+    all_picks: dict,
+    corrected_by_shot: dict,
+    layer_results: dict,
+    perp_by_shot: dict | None = None,
+    inline_shift_by_shot: dict | None = None,
+    perp_m: float = 0.0,
+    shot_label_pos: dict | None = None,
+    geometry_paths: list | None = None,
+    report_paths: list | None = None,
+    manual_geometry_paths: list | None = None,
+    raw_folder: Path | str | None = None,
+    po_sources: list | None = None,
+    picker_method: str | None = None,
+    acquisition_time_de: str | None = None,
+    seg2_mid_xyz: Any = None,
+    finalize: bool = True,
+) -> dict:
+    """Write every output file for a completed (or preview) profile analysis.
+
+    This is the single implementation of "save everything" - both
+    `process_profile` (CLI/batch) and `lvl_studio.py`'s interactive
+    analysis call this, so there is exactly one place that decides what
+    gets written and in what order, not two that can drift apart.
+
+    Writes: picks Excel, T-X plot, arrivals plot, layer-fit RMS plot, and
+    (if `finalize=True`) picks.txt, the velocity summary Excel,
+    picks.json/layer_analysis.json (clearing the in-progress session
+    files), plus a processing_report.md capturing which geometry/field-
+    report/coordinate files were used and the resulting parameters -
+    every time, finalized or preview.
+
+    Returns {"analysis": dict, "output_files": [Path, ...]}.
+    """
+    analysis = build_analysis_from_layers(corrected_by_shot, layer_results)
+    output_files: list[Path] = []
+    suffix = "" if finalize else "_preview"
+
+    output_files.append(export_excel(
+        profile_name, shots_info, all_picks, recv_positions, analysis, cfg,
+        corrected_by_shot=corrected_by_shot, layer_results=layer_results,
+        perp_by_shot=perp_by_shot, filename_suffix=suffix,
+    ))
+    output_files.append(export_tx_plot(
+        profile_name, shots_info, all_picks, recv_positions, analysis,
+        perp_m=perp_m, shot_label_pos=shot_label_pos or {},
+        corrected_by_shot=corrected_by_shot, layer_results=layer_results, theme=THEME,
+    ))
+    output_files.append(export_arrivals_observed_computed_plot(
+        profile_name, corrected_by_shot, layer_results, filename_suffix=suffix, theme=THEME,
+    ))
+    output_files.append(export_layer_fit_rms_plot(
+        profile_name, corrected_by_shot, layer_results, filename_suffix=suffix, theme=THEME,
+    ))
+
+    if finalize:
+        output_files.append(export_picks_txt(profile_name, shots_info, all_picks, recv_positions))
+        output_files.append(export_velocity_summary_excel(
+            profile_name=profile_name, cfg=cfg, recv_positions=recv_positions,
+            shots_info=shots_info, layer_results=layer_results, analysis=analysis,
+            output_dir=core_paths.require_active_project().velocity_dir,
+            geometry_excel_paths=[Path(p) for p in (geometry_paths or [])],
+            acquisition_time_de=acquisition_time_de, seg2_mid_xyz=seg2_mid_xyz,
+        ))
+        save_picks_json(profile_name, all_picks)
+        save_layer_json(profile_name, layer_results)
+        clear_session_picks_json(profile_name)
+        clear_layer_session_json(profile_name)
+    else:
+        save_layer_session_json(profile_name, layer_results)
+
+    report_path = export_processing_report(
+        profile_name=profile_name, cfg=cfg, analysis=analysis, layer_results=layer_results,
+        perp_by_shot=perp_by_shot, inline_shift_by_shot=inline_shift_by_shot,
+        po_sources=po_sources, geometry_paths=geometry_paths, report_paths=report_paths,
+        manual_geometry_paths=manual_geometry_paths, raw_folder=raw_folder,
+        picker_method=picker_method, output_files=[str(p) for p in output_files],
+        filename_suffix=suffix,
+    )
+    output_files.append(report_path)
+
+    return {"analysis": analysis, "output_files": output_files}
 
 
 def process_profile(profile_name: str, pick_mode: bool = True,
@@ -570,64 +659,39 @@ def process_profile(profile_name: str, pick_mode: bool = True,
     )
     analysis_bundle = analysis_ui.run()
     perp_by_shot = analysis_bundle["perp_by_shot"]
+    inline_shift_by_shot = analysis_bundle["inline_shift_by_shot"]
     corrected_by_shot = analysis_bundle["corrected_by_shot"]
     layer_results = analysis_bundle["layer_results"]
-    analysis = build_analysis_from_layers(corrected_by_shot, layer_results)
-    save_layer_session_json(profile_name, layer_results)
 
-    qc_suffix = "_preview" if preview_only else ""
+    geometry_paths = [p for p in (perp_excel_cfg or {}).get("geometry_paths", []) if p]
+    picker_method = "Picker Engine V2 (auto-pick)" if auto_pick else "Interactive (v1 picker)"
+
+    result = export_full_analysis(
+        profile_name=profile_name,
+        cfg=cfg,
+        shots_info=shots_info_proc,
+        recv_positions=recv_positions,
+        all_picks=all_picks,
+        corrected_by_shot=corrected_by_shot,
+        layer_results=layer_results,
+        perp_by_shot=perp_by_shot,
+        inline_shift_by_shot=inline_shift_by_shot,
+        perp_m=perp_m,
+        shot_label_pos=shot_label_pos,
+        geometry_paths=geometry_paths,
+        raw_folder=raw_dir,
+        picker_method=picker_method,
+        acquisition_time_de=acquisition_time_de,
+        seg2_mid_xyz=seg2_mid_xyz,
+        finalize=not preview_only,
+    )
 
     if preview_only:
-        export_excel(profile_name, shots_info_proc, all_picks, recv_positions,
-                     analysis, cfg,
-                     corrected_by_shot=corrected_by_shot,
-                     layer_results=layer_results,
-                     perp_by_shot=perp_by_shot,
-                     filename_suffix="_preview")
-        export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
-                       analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
-                       corrected_by_shot=corrected_by_shot, layer_results=layer_results,
-                       theme=THEME)
-        export_arrivals_observed_computed_plot(
-            profile_name, corrected_by_shot, layer_results, filename_suffix="_preview", theme=THEME
-        )
-        export_layer_fit_rms_plot(
-            profile_name, corrected_by_shot, layer_results, filename_suffix="_preview", theme=THEME
-        )
         print("  Preview files written; final picks.json not updated.")
         return
 
-    export_picks_txt(profile_name, shots_info_proc, all_picks, recv_positions)
-    export_excel(profile_name, shots_info_proc, all_picks, recv_positions,
-                 analysis, cfg,
-                 corrected_by_shot=corrected_by_shot,
-                 layer_results=layer_results,
-                 perp_by_shot=perp_by_shot)
-    export_tx_plot(profile_name, shots_info_proc, all_picks, recv_positions,
-                   analysis, perp_m=perp_m, shot_label_pos=shot_label_pos,
-                   corrected_by_shot=corrected_by_shot, layer_results=layer_results,
-                   theme=THEME)
-    export_arrivals_observed_computed_plot(profile_name, corrected_by_shot, layer_results, theme=THEME)
-    export_layer_fit_rms_plot(profile_name, corrected_by_shot, layer_results, theme=THEME)
-    geometry_excels = [Path(p) for p in (perp_excel_cfg or {}).get("geometry_paths", []) if p]
-    export_velocity_summary_excel(
-        profile_name=profile_name,
-        cfg=cfg,
-        recv_positions=recv_positions,
-        shots_info=shots_info_proc,
-        layer_results=layer_results,
-        analysis=analysis,
-        output_dir=core_paths.require_active_project().velocity_dir,
-        geometry_excel_paths=geometry_excels,
-        acquisition_time_de=acquisition_time_de,
-        seg2_mid_xyz=seg2_mid_xyz,
-    )
-    save_picks_json(profile_name, all_picks)
-    save_layer_json(profile_name, layer_results)
-    clear_session_picks_json(profile_name)
-    clear_layer_session_json(profile_name)
     _ap = core_paths.require_active_project()
     print(f"\n  Output -> " f"{(_ap.results_dir / profile_name).relative_to(_ap.root)}")
 
 
-__all__ = ["AnalysisWorkflow", "process_profile"]
+__all__ = ["AnalysisWorkflow", "process_profile", "export_full_analysis"]

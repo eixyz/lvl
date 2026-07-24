@@ -54,9 +54,14 @@ from src.picker.preprocessing import (
 )
 from src.picker.refinement import _zero_crossing_from_extremum_samples
 from src.picker.features import hilbert_envelope_pick
-from src.io.pick_reader import save_session_picks_json
+from src.picker.picker import FirstBreakPicker as FirstBreakPickerV2
+from src.picker.settings import PickerSettings as PickerSettingsV2
+from src.io.pick_reader import (
+    save_session_picks_json, save_layer_session_json,
+    load_layer_json, load_layer_session_json,
+)
 from src.io.exporters import export_velocity_summary_excel
-from src.refraction.pipeline import AnalysisWorkflow
+from src.refraction.pipeline import AnalysisWorkflow, export_full_analysis
 from src.refraction.velocity_model import compute_layer_averages
 from src.refraction.layer_analysis import build_analysis_from_layers
 
@@ -374,6 +379,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self._display_window: QtWidgets.QMainWindow | None = None
         self._current_folder: Path | None = None
         self._last_analysis: dict[str, Any] | None = None
+        self._last_pick_method: str = "Interactive (manual)"
         self._custom_geom_positions: np.ndarray | None = None
         self._custom_geom_path: str | None = None
         self._view_xlim: tuple[float, float] | None = None
@@ -664,15 +670,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_clear_picks = QtWidgets.QPushButton("Clear Shot Picks")
         self.chk_layer_pick = QtWidgets.QCheckBox("Layer pick UI")
         self.chk_layer_pick.setChecked(False)
-        self.chk_auto_pick_v2 = QtWidgets.QCheckBox("Auto-pick with Picker V2")
-        self.chk_auto_pick_v2.setChecked(False)
-        self.chk_auto_pick_v2.setToolTip(
-            "Run Full Computation picks every shot automatically with the new\n"
-            "Picker Engine V2 (features -> likelihood -> coherence -> path\n"
-            "optimization -> confidence/quality) instead of opening the\n"
-            "interactive picker. Review low-confidence traces afterward."
-        )
-        self.btn_run_compute = QtWidgets.QPushButton("Run Full Computation")
         self.btn_run_analysis = QtWidgets.QPushButton("Run Interactive Analysis")
 
         self.chk_use_seg2_delay = QtWidgets.QCheckBox("Use SEG2 delay")
@@ -730,8 +727,16 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.spin_butter_order.setValue(self.settings.butter_order)
 
         self.cmb_auto_mode = QtWidgets.QComboBox()
-        self.cmb_auto_mode.addItems(["stalta", "maxdiff_zero", "hilbert_env"])
+        self.cmb_auto_mode.addItems(["stalta", "maxdiff_zero", "hilbert_env", "picker_v2"])
         self.cmb_auto_mode.setCurrentText(self.settings.auto_pick_mode)
+        self.cmb_auto_mode.setToolTip(
+            "stalta / maxdiff_zero / hilbert_env: legacy single-feature triggers.\n"
+            "picker_v2: full pipeline per shot - preprocessing -> features "
+            "(Hilbert, STA/LTA, AIC, gradient, energy, SNR, kurtosis, skewness) "
+            "-> likelihood fusion -> cross-trace coherence -> path optimization "
+            "-> confidence/quality flags. Low-confidence picks are placed but "
+            "flagged in the status bar for review, not silently dropped."
+        )
         self.cmb_hilbert_target = QtWidgets.QComboBox()
         self.cmb_hilbert_target.addItems(["onset", "peak"])
         self.cmb_hilbert_target.setCurrentText(self.settings.hilbert_target)
@@ -820,9 +825,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         cmp_form = QtWidgets.QFormLayout(page_compute)
         cmp_form.setContentsMargins(6, 6, 6, 6)
         cmp_form.addRow(self.chk_layer_pick)
-        cmp_form.addRow(self.chk_auto_pick_v2)
         cmp_form.addRow(self.btn_run_analysis)
-        cmp_form.addRow(self.btn_run_compute)
 
         page_layers = QtWidgets.QWidget(self)
         layers_v = QtWidgets.QVBoxLayout(page_layers)
@@ -867,7 +870,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.results_table = QtWidgets.QTableWidget(self)
         self.results_table.setColumnCount(2)
         self.results_table.setHorizontalHeaderLabels(["Result", "Value"])
-        self.btn_save_excel = QtWidgets.QPushButton("Save Excel Summary")
+        self.btn_save_excel = QtWidgets.QPushButton("Save All Results")
         self.btn_save_excel.setEnabled(False)
         results_layout.addWidget(self.results_table)
         results_layout.addWidget(self.btn_save_excel)
@@ -890,7 +893,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_auto_pick.clicked.connect(self._auto_pick_current_shot)
         self.btn_save_picks.clicked.connect(self._save_picks_current_profile)
         self.btn_clear_picks.clicked.connect(self._clear_current_shot_picks)
-        self.btn_run_compute.clicked.connect(self._run_full_computation)
         self.btn_run_analysis.clicked.connect(self._run_interactive_analysis)
         self.btn_save_excel.clicked.connect(self._save_excel_summary)
         self.btn_import_layer.clicked.connect(self._import_pick_layer)
@@ -996,9 +998,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         menu_pick.addAction(act_save)
 
         menu_compute = self.menuBar().addMenu("Compute")
-        act_run_compute = QAction("Run Full Computation", self)
-        act_run_compute.triggered.connect(self._run_full_computation)
-        menu_compute.addAction(act_run_compute)
+        act_run_analysis = QAction("Run Interactive Analysis", self)
+        act_run_analysis.triggered.connect(self._run_interactive_analysis)
+        menu_compute.addAction(act_run_analysis)
+
+        act_save_all = QAction("Save All Results", self)
+        act_save_all.triggered.connect(self._save_excel_summary)
+        menu_compute.addAction(act_save_all)
 
         nav_menu = self.menuBar().addMenu("Navigate")
         act_prev = QAction("Previous Shot", self)
@@ -1453,6 +1459,34 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         rp = self._receiver_positions_for_shot(shot)
         shot_pos = self._shot_geom_position(shot, rp)
         count = 0
+
+        if mode == "picker_v2":
+            raw_data = np.asarray(shot.data, dtype=np.float64)
+            offsets_m = [float(rp[i]) - float(shot_pos) if i < len(rp) else 0.0
+                        for i in range(raw_data.shape[0])]
+            v2_settings = PickerSettingsV2()
+            v2_picker = FirstBreakPickerV2(settings=v2_settings)
+            try:
+                v2_results = v2_picker.pick_profile(raw_data, dt_s, offsets_m=offsets_m)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, "Auto Pick (Picker V2)", f"Failed: {exc}")
+                v2_results = []
+            low_conf = 0
+            for i, r in enumerate(v2_results):
+                if r.sample is None:
+                    continue
+                picks[i] = round(t0 + float(r.sample) * shot.dt_ms, 2)
+                count += 1
+                if r.confidence is not None and r.confidence < v2_settings.minimum_confidence:
+                    low_conf += 1
+            self._last_pick_method = "Picker Engine V2 (auto, per-shot)"
+            self.statusBar().showMessage(
+                f"Auto-pick (Picker V2 - features>likelihood>coherence>optimize>confidence): "
+                f"{count}/{shot.n_traces} placed"
+                + (f", {low_conf} flagged low-confidence (review before trusting)" if low_conf else "")
+            )
+            self._render_current()
+            return
 
         if mode == "stalta":
             n_sta = max(1, int(0.003 / dt_s))
@@ -1987,6 +2021,24 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select SEG2 folder", start_dir)
         if not folder:
             return
+
+        if Path(folder).resolve() != (self._current_folder.resolve() if self._current_folder else None):
+            old_profile = self.current_profile
+            has_unsaved_work = bool(self.shots) and (
+                any(self.picks_by_shot.get(i) for i in range(len(self.shots))) or self._last_analysis
+            )
+            if has_unsaved_work:
+                choice = QtWidgets.QMessageBox.question(
+                    self, "Switch Profile",
+                    f"Switch away from profile '{old_profile or '(unknown)'}'?\n\n"
+                    "Current picks (and any computed layer analysis) will be "
+                    "auto-saved first, so nothing is lost.",
+                    QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                )
+                if choice != QtWidgets.QMessageBox.StandardButton.Ok:
+                    return
+                self._autosave_current_work()
+
         self._current_folder = Path(folder)
         try:
             self.shots = self._load_seg2_folder(Path(folder))
@@ -2019,7 +2071,10 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             if profile_name:
                 n_geo = len(self._discover_geometry_excels())
                 n_rep = len(self._discover_report_paths())
+                has_layers = bool(load_layer_session_json(profile_name) or load_layer_json(profile_name))
                 found_msg = f" | geometry files: {n_geo}, field reports: {n_rep}"
+                if has_layers:
+                    found_msg += " | previous layer analysis available (resumes automatically)"
             self.statusBar().showMessage(f"Loaded {len(self.shots)} shots from {folder}{loaded_msg}{found_msg}")
         else:
             self.current_idx = -1
@@ -2072,16 +2127,40 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         return 0
 
-    def _save_picks_current_profile(self):
-        profile_name = self._profile_name_from_open_folder()
+    def _autosave_current_work(self):
+        """Persist whatever isn't saved yet for the profile currently open:
+        picks, and - if 'Run Interactive Analysis' was run but 'Save All
+        Results' wasn't clicked - the computed layer-analysis session too
+        (as a resumable session snapshot, not a full export; the full
+        export set is still only written by 'Save All Results', since it's
+        a heavier operation with several plot files).
 
-        if not profile_name or not self.shots:
-            self._save_picks_json()
-            return
+        Called automatically before switching profile folders, and safe
+        to call any other time work should be checkpointed.
+        """
+        if self._current_folder and self.shots:
+            try:
+                self._save_picks_current_profile()
+            except Exception as exc:
+                self.statusBar().showMessage(f"Auto-save of picks failed: {exc}")
 
+        if self._last_analysis and self._last_analysis.get("profile") == self.current_profile:
+            try:
+                save_layer_session_json(
+                    self._last_analysis["profile"], self._last_analysis["layer_results"]
+                )
+            except Exception as exc:
+                self.statusBar().showMessage(f"Auto-save of layer analysis failed: {exc}")
+
+    def _write_picks_to_disk(self, profile_name: str) -> Path | None:
+        """Write picks.json + picks.session.json for `profile_name` from
+        the current in-memory `picks_by_shot`. No status-bar message -
+        used both by the explicit 'Save Picks' button and by silent
+        background autosave (shot navigation, profile switch).
+        """
         project = self._require_project()
         if project is None:
-            return
+            return None
 
         picks_path = project.paths.picks_json(profile_name)
         session_path = project.paths.session_picks_json(profile_name)
@@ -2099,15 +2178,26 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         with open(picks_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
-
         with open(session_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
 
         project.register_profile(profile_name)
         pio.save_project(project)
+        return picks_path
+
+    def _save_picks_current_profile(self):
+        profile_name = self._profile_name_from_open_folder()
+
+        if not profile_name or not self.shots:
+            self._save_picks_json()
+            return
+
+        picks_path = self._write_picks_to_disk(profile_name)
+        if picks_path is None:
+            return
 
         self.statusBar().showMessage(
-            f"Picks saved to {project.paths.relative(picks_path)}"
+            f"Picks saved to {self.project.paths.relative(picks_path)}"
         )
 
     def _profile_name_from_open_folder(self) -> str | None:
@@ -2143,78 +2233,6 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             picks = self.picks_by_shot.get(idx, {})
             all_picks[shot_id] = {int(k): float(v) for k, v in picks.items()}
         save_session_picks_json(profile_name, all_picks)
-
-    def _run_full_computation(self):
-        profile_name = self._profile_name_from_open_folder()
-        if not profile_name:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Computation Setup",
-                "Open a profile folder under the project's raw data folder to run full computation with the lvl_refraction backend.",
-            )
-            return
-        if not self.shots:
-            QtWidgets.QMessageBox.warning(self, "Computation Setup", "No shots loaded.")
-            return
-
-        geom_txt = self.cmb_geom_view.currentText().strip().lower()
-        geom_override = 100 if geom_txt == "100" else 200 if geom_txt == "200" else None
-        enable_layer_pick = bool(self.chk_layer_pick.isChecked())
-        auto_pick_v2 = bool(self.chk_auto_pick_v2.isChecked())
-
-        try:
-            self._export_picks_to_lvl_refraction_session(profile_name)
-
-            from src.refraction.pipeline import process_profile
-
-            metadata_folder = self.project.metadata_folder if self.project else None
-            report_paths = (
-                [str(p) for p in discover_field_report_excels(metadata_folder)]
-                if metadata_folder else []
-            )
-            geometry_paths: list[str] = [str(p) for p in self._discover_geometry_excels()]
-            perp_excel_cfg = {
-                "paths": report_paths,
-                "sheet": None,
-                "ffid_col": "A",
-                "perp_col": "D",
-                "profile_col": "F",
-                "inline_shift_col": None,
-                "geometry_paths": geometry_paths,
-                "device_type": "sw_maps",
-            }
-
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor if hasattr(QtCore.Qt, "CursorShape") else QtCore.Qt.WaitCursor)
-            self.statusBar().showMessage(f"Running full computation for profile {profile_name}...")
-
-            process_profile(
-                profile_name=profile_name,
-                pick_mode=False,
-                geom_override=geom_override,
-                perp_excel_cfg=perp_excel_cfg,
-                enable_layer_pick=enable_layer_pick,
-                control_file=None,
-                show_plot_controls=True,
-                raw_dir=self.project.raw_folder if self.project else None,
-                auto_pick=auto_pick_v2,
-            )
-
-            reports_hint = self.project.paths.relative(self.project.paths.reports_dir_for(profile_name))
-            self.statusBar().showMessage(f"Computation finished for {profile_name}. See {reports_hint}")
-            QtWidgets.QMessageBox.information(
-                self,
-                "Computation Finished",
-                f"Full computation finished for profile '{profile_name}'.\nOutputs are in {reports_hint}.",
-            )
-        except Exception as exc:
-            tb = traceback.format_exc(limit=8)
-            self.statusBar().showMessage(f"Computation failed: {exc}")
-            QtWidgets.QMessageBox.critical(self, "Computation Error", f"{exc}\n\n{tb}")
-        finally:
-            try:
-                QtWidgets.QApplication.restoreOverrideCursor()
-            except Exception:
-                pass
 
     def _derive_shot_positions(self, recv_positions: np.ndarray) -> list[tuple[int, float]]:
         # Geometry-derived positions (script parity). This keeps the middle
@@ -2309,6 +2327,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         else:
             self.statusBar().showMessage("No field-report PO found; using PO=0.0 (editable in the PO window).")
 
+        existing_layer_results = load_layer_session_json(profile) or load_layer_json(profile) or {}
+        if existing_layer_results:
+            self.statusBar().showMessage(
+                f"Resuming from previously saved layer analysis for '{profile}'."
+            )
+
         try:
             wf = AnalysisWorkflow(
                 profile_name=profile,
@@ -2320,7 +2344,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 perp_override=perp_override or None,
                 inline_shift_override=shift_override or None,
                 enable_layer_pick=True,
-                existing_layer_results={},
+                existing_layer_results=existing_layer_results,
             )
             out = wf.run()
             layer_results = out.get("layer_results", {})
@@ -2332,10 +2356,14 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 "cfg": cfg,
                 "recv_positions": recv_positions,
                 "shots_info": shots_info,
+                "shot_label_pos": shot_label_pos,
+                "all_picks": all_picks,
                 "layer_results": layer_results,
                 "corrected_by_shot": corrected_by_shot,
+                "inline_shift_by_shot": out.get("inline_shift_by_shot", {}),
                 "avg": avg,
                 "perp_override": perp_override,
+                "po_sources": po_sources,
             }
             self._populate_results(avg, perp_override, po_sources)
             self.btn_save_excel.setEnabled(True)
@@ -2373,33 +2401,60 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.results_table.resizeColumnsToContents()
 
     def _save_excel_summary(self):
+        """Save every expected output for the last 'Run Interactive Analysis'
+        run: picks Excel, T-X plot, arrivals plot, layer-fit RMS plot,
+        velocity summary Excel, picks.json/layer_analysis.json, and a
+        processing_report.md recording which geometry/field-report/
+        coordinate files were used - the same complete set of files
+        `process_profile` writes in the CLI, via the same shared
+        `export_full_analysis()` (src/refraction/pipeline.py), so nothing
+        is missing just because you worked interactively instead.
+        """
         if not self._last_analysis:
-            QtWidgets.QMessageBox.information(self, "Save Excel", "Run Interactive Analysis first.")
+            QtWidgets.QMessageBox.information(self, "Save Results", "Run Interactive Analysis first.")
             return
         a = self._last_analysis
+        project = self._require_project()
+        if project is None:
+            return
         try:
-            analysis = build_analysis_from_layers(a["corrected_by_shot"], a["layer_results"])
-            project = self._require_project()
-            if project is None:
-                return
             geometry_paths = [str(p) for p in self._discover_geometry_excels()]
-            out_dir = project.paths.velocity_dir
-            out_dir.mkdir(parents=True, exist_ok=True)
-            path = export_velocity_summary_excel(
+            report_paths = [str(p) for p in self._discover_report_paths()]
+            manual_geometry_paths = [str(p) for p in project.manual_geometry_files]
+
+            result = export_full_analysis(
                 profile_name=a["profile"],
                 cfg=a["cfg"],
-                recv_positions=a["recv_positions"],
                 shots_info=a["shots_info"],
+                recv_positions=a["recv_positions"],
+                all_picks=a["all_picks"],
+                corrected_by_shot=a["corrected_by_shot"],
                 layer_results=a["layer_results"],
-                analysis=analysis,
-                output_dir= out_dir,
-                geometry_excel_paths=geometry_paths,
+                perp_by_shot=a["perp_override"],
+                inline_shift_by_shot=a.get("inline_shift_by_shot"),
+                shot_label_pos=a.get("shot_label_pos"),
+                geometry_paths=geometry_paths,
+                report_paths=report_paths,
+                manual_geometry_paths=manual_geometry_paths,
+                raw_folder=project.raw_folder,
+                po_sources=a.get("po_sources"),
+                picker_method=getattr(self, "_last_pick_method", "Interactive (manual)"),
+                finalize=True,
             )
-            self.statusBar().showMessage(f"Excel summary saved: {path}")
-            QtWidgets.QMessageBox.information(self, "Save Excel", f"Velocity summary saved to:\n{path}")
+            project.register_profile(a["profile"])
+            pio.save_project(project)
+
+            files_txt = "\n".join(f"  - {p}" for p in result["output_files"])
+            self.statusBar().showMessage(
+                f"Saved {len(result['output_files'])} file(s) for profile '{a['profile']}'."
+            )
+            QtWidgets.QMessageBox.information(
+                self, "Save Results",
+                f"Saved {len(result['output_files'])} file(s):\n{files_txt}",
+            )
         except Exception as exc:
             tb = traceback.format_exc(limit=8)
-            QtWidgets.QMessageBox.critical(self, "Save Excel Error", f"{exc}\n\n{tb}")
+            QtWidgets.QMessageBox.critical(self, "Save Results Error", f"{exc}\n\n{tb}")
 
     def _discover_geometry_excels(self) -> list[Path]:
         """Every geometry/coordinate file available for the current project.
@@ -2528,6 +2583,17 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         if idx < 0 or idx >= len(self.shots):
             self.current_idx = -1
             return
+        # Background autosave: cheap (a couple of small JSON writes), so we
+        # just do it on every shot change rather than trying to track a
+        # precise "dirty" flag - picking work is never more than one shot
+        # navigation away from being on disk.
+        if self.current_idx >= 0 and self._current_folder:
+            profile_name = self._profile_name_from_open_folder()
+            if profile_name:
+                try:
+                    self._write_picks_to_disk(profile_name)
+                except Exception:
+                    pass  # never block navigation on a save hiccup
         self.current_idx = idx
         self._render_current()
 
@@ -2647,9 +2713,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    from src.common.logging_setup import setup_file_logging
+    log_path = setup_file_logging("lvl_studio")
+    print(f"Logging to: {log_path}")
+
     app = QtWidgets.QApplication(sys.argv)
     win = LvlStudioWindow()
-    win.statusBar().showMessage(f"{QT_API} active. Open a SEG2 folder to start.")
+    win.statusBar().showMessage(f"{QT_API} active. Open a SEG2 folder to start. Log: {log_path.name}")
     win.show()
     if hasattr(app, "exec"):
         return app.exec()

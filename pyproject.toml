@@ -1,0 +1,14 @@
+[project]
+name = "lvl-seismic"
+version = "0.1.0"
+description = "LVL Seismic Studio"
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "obspy",
+    "PySide6",
+    "pandas",
+    "openpyxl"
+]
