@@ -32,7 +32,10 @@ from typing import Any
 import numpy as np
 
 from src.common import paths as core_paths
-from src.common.settings import PROFILES, USE_SEG2_SHOT_POSITION, BULK_SHIFT_MS, THEME
+from src.common.settings import (
+    PROFILES, USE_SEG2_SHOT_POSITION, BULK_SHIFT_MS, THEME,
+    DISPLAY_MODE, CLIP_FACTOR, WIGGLE_STRETCH,
+)
 from src.picker.preprocessing import apply_ormsby_all
 from src.picker.picker import FirstBreakPicker as FirstBreakPickerV2
 from src.picker.settings import PickerSettings as PickerSettingsV2
@@ -47,14 +50,14 @@ from src.utils.geometry import (
     load_geometry, auto_shot_positions,
     infer_geometry_from_spread_length, infer_geometry_from_seg2_file,
     load_profile_geometry_from_excels, infer_geometry_from_field_report,
-    load_profile_offsets_from_excel,
+    load_profile_offsets_from_excel, load_midpoint_xyz_from_geometry_excels,
 )
 from src.refraction.processing import resolve_perp_by_shot
 from src.refraction.layer_analysis import build_corrected_pick_data, build_analysis_from_layers
 from src.io.exporters import (
     export_velocity_summary_excel, export_excel, export_picks_txt,
     export_tx_plot, export_arrivals_observed_computed_plot, export_layer_fit_rms_plot,
-    export_processing_report,
+    export_processing_report, export_shot_qc_plot,
 )
 
 
@@ -162,6 +165,11 @@ def export_full_analysis(
     acquisition_time_de: str | None = None,
     seg2_mid_xyz: Any = None,
     finalize: bool = True,
+    raw_shots: dict[int, tuple] | None = None,
+    qc_display_mode: str = DISPLAY_MODE,
+    qc_clip_factor: float = CLIP_FACTOR,
+    qc_wiggle_scale: float = WIGGLE_STRETCH,
+    qc_cmap: str = "gray",
 ) -> dict:
     """Write every output file for a completed (or preview) profile analysis.
 
@@ -177,11 +185,40 @@ def export_full_analysis(
     report/coordinate files were used and the resulting parameters -
     every time, finalized or preview.
 
+    `raw_shots`, if given, maps shot_id -> (data, dt_s, delay_ms,
+    shot_pos_m) for every shot that has picks, and triggers one QC wiggle
+    plot per shot with its picks marked (proof the picks landed on
+    genuine arrivals) - this is optional because `process_profile`'s CLI
+    path and `lvl_studio.py`'s interactive path have raw trace data
+    available in different forms; the caller supplies it if it wants
+    these plots written.
+
     Returns {"analysis": dict, "output_files": [Path, ...]}.
     """
     analysis = build_analysis_from_layers(corrected_by_shot, layer_results)
     output_files: list[Path] = []
     suffix = "" if finalize else "_preview"
+
+    # Resolve which geometry/coordinate file was actually matched for this
+    # profile, not just which ones were searched - the report should say
+    # what was USED, not everything that happened to be in the folder.
+    geometry_candidates = [Path(p) for p in (geometry_paths or [])]
+    geometry_used: list[str] = []
+    if geometry_candidates:
+        try:
+            _len, _x, _y, _z, gsrc, *_rest = load_profile_geometry_from_excels(profile_name, geometry_candidates)
+            if gsrc:
+                geometry_used.append(str(gsrc))
+        except Exception:
+            pass
+        try:
+            _x2, _y2, _z2, xyzsrc = load_midpoint_xyz_from_geometry_excels(
+                profile_name, float(perp_m or 0.0), geometry_candidates
+            )
+            if xyzsrc and str(xyzsrc) not in geometry_used:
+                geometry_used.append(str(xyzsrc))
+        except Exception:
+            pass
 
     output_files.append(export_excel(
         profile_name, shots_info, all_picks, recv_positions, analysis, cfg,
@@ -200,13 +237,31 @@ def export_full_analysis(
         profile_name, corrected_by_shot, layer_results, filename_suffix=suffix, theme=THEME,
     ))
 
+    if raw_shots:
+        for shot_id, picks_for_shot in all_picks.items():
+            if not picks_for_shot:
+                continue
+            entry = raw_shots.get(int(shot_id))
+            if entry is None:
+                continue
+            shot_data, shot_dt_s, shot_delay_ms, shot_pos_m = entry
+            try:
+                output_files.append(export_shot_qc_plot(
+                    profile_name, int(shot_id), shot_data, shot_dt_s, shot_delay_ms,
+                    picks_for_shot, shot_pos_m=shot_pos_m, theme=THEME, filename_suffix=suffix,
+                    display_mode=qc_display_mode, clip_factor=qc_clip_factor,
+                    wiggle_scale=qc_wiggle_scale, cmap=qc_cmap,
+                ))
+            except Exception as exc:
+                print(f"     [WARN] QC plot failed for shot {shot_id}: {exc}")
+
     if finalize:
         output_files.append(export_picks_txt(profile_name, shots_info, all_picks, recv_positions))
         output_files.append(export_velocity_summary_excel(
             profile_name=profile_name, cfg=cfg, recv_positions=recv_positions,
             shots_info=shots_info, layer_results=layer_results, analysis=analysis,
             output_dir=core_paths.require_active_project().velocity_dir,
-            geometry_excel_paths=[Path(p) for p in (geometry_paths or [])],
+            geometry_excel_paths=geometry_candidates,
             acquisition_time_de=acquisition_time_de, seg2_mid_xyz=seg2_mid_xyz,
         ))
         save_picks_json(profile_name, all_picks)
@@ -216,13 +271,21 @@ def export_full_analysis(
     else:
         save_layer_session_json(profile_name, layer_results)
 
+    parameters = {
+        "geom_type": cfg.get("geom"),
+        "line_no": cfg.get("line_no", profile_name),
+        "perp_m_base": cfg.get("perp_m", 0.0),
+        "n_shots": len(shots_info),
+        "n_picks_total": sum(len(v) for v in all_picks.values()),
+    }
+
     report_path = export_processing_report(
         profile_name=profile_name, cfg=cfg, analysis=analysis, layer_results=layer_results,
         perp_by_shot=perp_by_shot, inline_shift_by_shot=inline_shift_by_shot,
-        po_sources=po_sources, geometry_paths=geometry_paths, report_paths=report_paths,
+        po_sources=po_sources, geometry_paths=geometry_used, report_paths=po_sources,
         manual_geometry_paths=manual_geometry_paths, raw_folder=raw_folder,
         picker_method=picker_method, output_files=[str(p) for p in output_files],
-        filename_suffix=suffix,
+        filename_suffix=suffix, parameters=parameters,
     )
     output_files.append(report_path)
 
@@ -583,6 +646,13 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         shot_id = int(shot["shot_id"])
         shots_meta.append((shot_id, float(shot["shot_pos_m"]), float(shot["shot_pos_nominal"])))
 
+    raw_shots = {
+        int(shot["shot_id"]): (
+            shot["data_raw"], float(shot["dt_s"]), float(shot["delay_ms"]), float(shot["shot_pos_m"])
+        )
+        for shot in shot_cache
+    }
+
     excel_perp_by_shot: dict = {}
     excel_shift_by_shot: dict = {}
     ffid_by_shot = {
@@ -684,6 +754,7 @@ def process_profile(profile_name: str, pick_mode: bool = True,
         acquisition_time_de=acquisition_time_de,
         seg2_mid_xyz=seg2_mid_xyz,
         finalize=not preview_only,
+        raw_shots=raw_shots,
     )
 
     if preview_only:

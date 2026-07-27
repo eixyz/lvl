@@ -41,6 +41,7 @@ from src.io import project_io as pio
 # (shared with the CLI) - see docs/architecture.md.
 from src.utils.geometry import (
     load_geometry,
+    auto_shot_positions,
     load_profile_geometry_from_excels,
     infer_geometry_from_seg2_file,
     discover_field_report_excels,
@@ -153,6 +154,7 @@ class StudioSettings:
     hilbert_onset_pct: float = 0.08
     pick_order: str = "F>G>X"
     manual_snap_win_ms: float = 6.0
+    max_negative_jump_ms: float = 5.0
     geometry_override: str = "auto"
     x_axis_mode: str = "geom_x"
     invert_y_axis: bool = True
@@ -380,6 +382,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self._current_folder: Path | None = None
         self._last_analysis: dict[str, Any] | None = None
         self._last_pick_method: str = "Interactive (manual)"
+        self._v2_settings = PickerSettingsV2()
         self._custom_geom_positions: np.ndarray | None = None
         self._custom_geom_path: str | None = None
         self._view_xlim: tuple[float, float] | None = None
@@ -453,6 +456,136 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
         dlg.exec()
+
+    def _edit_v2_picker_settings(self):
+        """Expose the Picker Engine V2 tunables (feature weights, coherence
+        alignment/radius, optimizer penalties, confidence threshold) so
+        they can be adjusted against real data instead of only living as
+        code defaults.
+        """
+        s = self._v2_settings
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Picker V2 Settings")
+        dlg.resize(420, 560)
+        outer = QtWidgets.QVBoxLayout(dlg)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(inner)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        def dspin(value, lo, hi, step=0.05, decimals=3):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setDecimals(decimals)
+            sb.setValue(value)
+            return sb
+
+        form.addRow(QtWidgets.QLabel("<b>Feature weights</b> (relative; higher = trusted more)"))
+        w_hilbert = dspin(s.hilbert_weight, 0.0, 5.0)
+        w_stalta = dspin(s.stalta_weight, 0.0, 5.0)
+        w_aic = dspin(s.aic_weight, 0.0, 5.0)
+        w_gradient = dspin(s.gradient_weight, 0.0, 5.0)
+        w_energy = dspin(s.energy_weight, 0.0, 5.0)
+        w_snr = dspin(s.snr_weight, 0.0, 5.0)
+        w_kurtosis = dspin(s.kurtosis_weight, 0.0, 5.0)
+        w_skewness = dspin(s.skewness_weight, 0.0, 5.0)
+        for label, w in [("Hilbert", w_hilbert), ("STA/LTA", w_stalta), ("AIC", w_aic),
+                         ("Gradient", w_gradient), ("Energy", w_energy), ("SNR", w_snr),
+                         ("Kurtosis", w_kurtosis), ("Skewness", w_skewness)]:
+            form.addRow(label, w)
+
+        form.addRow(QtWidgets.QLabel("<b>Processing</b>"))
+        sta_ms = dspin(s.sta_window, 0.1, 100.0, 0.5, 2)
+        lta_ms = dspin(s.lta_window, 0.5, 500.0, 1.0, 2)
+        hilbert_pct = dspin(s.hilbert_onset_pct, 0.0, 1.0, 0.01, 3)
+        form.addRow("STA window (ms)", sta_ms)
+        form.addRow("LTA window (ms)", lta_ms)
+        form.addRow("Hilbert onset threshold (0-1)", hilbert_pct)
+
+        form.addRow(QtWidgets.QLabel("<b>Coherence</b> (cross-trace reinforcement)"))
+        coh_weight = dspin(s.coherence_weight, 0.0, 1.0, 0.05, 2)
+        coh_radius = QtWidgets.QSpinBox(); coh_radius.setRange(1, 10); coh_radius.setValue(s.coherence_radius)
+        coh_align = QtWidgets.QCheckBox("Shift-align neighbours before comparing (recommended)")
+        coh_align.setChecked(s.coherence_align)
+        coh_align.setToolTip(
+            "If off, neighbouring traces are compared without correcting for "
+            "moveout - fast but actively hurts picks when receivers are far "
+            "enough apart that the arrival shifts by more than a few samples "
+            "between them (usually true for real data)."
+        )
+        coh_max_shift = QtWidgets.QSpinBox(); coh_max_shift.setRange(1, 200); coh_max_shift.setValue(s.coherence_max_shift)
+        form.addRow("Coherence weight (0=off)", coh_weight)
+        form.addRow("Coherence radius (neighbours/side)", coh_radius)
+        form.addRow(coh_align)
+        form.addRow("Alignment max shift (samples)", coh_max_shift)
+
+        form.addRow(QtWidgets.QLabel("<b>Velocity gate</b> (restricts picks to a physically plausible window per offset - prevents locking onto a later reflection/multiple)"))
+        gate_on = QtWidgets.QCheckBox("Enabled (strongly recommended)")
+        gate_on.setChecked(s.use_velocity_gate)
+        gate_vmin = dspin(s.vmin_m_s, 1.0, 20000.0, 10.0, 1)
+        gate_vmax = dspin(s.vmax_m_s, 1.0, 20000.0, 50.0, 1)
+        gate_pad = dspin(s.gate_pad_ms, 0.0, 500.0, 5.0, 1)
+        form.addRow(gate_on)
+        form.addRow("Min apparent velocity (m/s)", gate_vmin)
+        form.addRow("Max apparent velocity (m/s)", gate_vmax)
+        form.addRow("Gate padding (ms)", gate_pad)
+
+        form.addRow(QtWidgets.QLabel("<b>Path optimization</b>"))
+        smooth_pen = dspin(s.smoothness_penalty, 0.0, 5.0, 0.05, 3)
+        jump_pen = dspin(s.jump_penalty, 0.0, 5.0, 0.05, 3)
+        min_conf = dspin(s.minimum_confidence, 0.0, 1.0, 0.05, 2)
+        form.addRow("Smoothness penalty", smooth_pen)
+        form.addRow("Jump penalty", jump_pen)
+        form.addRow("Minimum confidence (below -> MANUAL_REVIEW)", min_conf)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            | QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        outer.addWidget(buttons)
+
+        def restore_defaults():
+            defaults = PickerSettingsV2()
+            for sb, val in [
+                (w_hilbert, defaults.hilbert_weight), (w_stalta, defaults.stalta_weight),
+                (w_aic, defaults.aic_weight), (w_gradient, defaults.gradient_weight),
+                (w_energy, defaults.energy_weight), (w_snr, defaults.snr_weight),
+                (w_kurtosis, defaults.kurtosis_weight), (w_skewness, defaults.skewness_weight),
+                (sta_ms, defaults.sta_window), (lta_ms, defaults.lta_window),
+                (hilbert_pct, defaults.hilbert_onset_pct), (coh_weight, defaults.coherence_weight),
+                (smooth_pen, defaults.smoothness_penalty), (jump_pen, defaults.jump_penalty),
+                (min_conf, defaults.minimum_confidence),
+                (gate_vmin, defaults.vmin_m_s), (gate_vmax, defaults.vmax_m_s),
+                (gate_pad, defaults.gate_pad_ms),
+            ]:
+                sb.setValue(val)
+            coh_radius.setValue(defaults.coherence_radius)
+            coh_align.setChecked(defaults.coherence_align)
+            coh_max_shift.setValue(defaults.coherence_max_shift)
+            gate_on.setChecked(defaults.use_velocity_gate)
+
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(restore_defaults)
+
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        s.hilbert_weight, s.stalta_weight, s.aic_weight = w_hilbert.value(), w_stalta.value(), w_aic.value()
+        s.gradient_weight, s.energy_weight, s.snr_weight = w_gradient.value(), w_energy.value(), w_snr.value()
+        s.kurtosis_weight, s.skewness_weight = w_kurtosis.value(), w_skewness.value()
+        s.sta_window, s.lta_window, s.hilbert_onset_pct = sta_ms.value(), lta_ms.value(), hilbert_pct.value()
+        s.coherence_weight, s.coherence_radius = coh_weight.value(), coh_radius.value()
+        s.coherence_align, s.coherence_max_shift = coh_align.isChecked(), coh_max_shift.value()
+        s.smoothness_penalty, s.jump_penalty, s.minimum_confidence = smooth_pen.value(), jump_pen.value(), min_conf.value()
+        s.use_velocity_gate = gate_on.isChecked()
+        s.vmin_m_s, s.vmax_m_s, s.gate_pad_ms = gate_vmin.value(), gate_vmax.value(), gate_pad.value()
+        self.statusBar().showMessage("Picker V2 settings updated.")
 
     def _reset_pick_layers(self):
         self.pick_layers = {"Mine": {}}
@@ -737,6 +870,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             "-> confidence/quality flags. Low-confidence picks are placed but "
             "flagged in the status bar for review, not silently dropped."
         )
+        self.btn_v2_settings = QtWidgets.QPushButton("Picker V2 Settings...")
         self.cmb_hilbert_target = QtWidgets.QComboBox()
         self.cmb_hilbert_target.addItems(["onset", "peak"])
         self.cmb_hilbert_target.setCurrentText(self.settings.hilbert_target)
@@ -753,6 +887,18 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.spin_manual_snap.setDecimals(2)
         self.spin_manual_snap.setSingleStep(0.5)
         self.spin_manual_snap.setValue(self.settings.manual_snap_win_ms)
+
+        self.spin_max_neg_jump = QtWidgets.QDoubleSpinBox()
+        self.spin_max_neg_jump.setRange(0.0, 200.0)
+        self.spin_max_neg_jump.setDecimals(1)
+        self.spin_max_neg_jump.setSingleStep(1.0)
+        self.spin_max_neg_jump.setValue(self.settings.max_negative_jump_ms)
+        self.spin_max_neg_jump.setToolTip(
+            "Auto Pick (stalta / maxdiff_zero / hilbert_env) rejects a trace's "
+            "pick if it's more than this many ms earlier than the previous "
+            "trace's accepted pick - catches the picker latching onto noise "
+            "on an individual trace. Set to a large value to disable."
+        )
 
         self.cmb_geom_view = QtWidgets.QComboBox()
         self.cmb_geom_view.addItems(["auto", "100", "200", "custom"])
@@ -812,10 +958,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         pick_form = QtWidgets.QFormLayout(page_pick)
         pick_form.setContentsMargins(6, 6, 6, 6)
         pick_form.addRow("Auto pick mode", self.cmb_auto_mode)
+        pick_form.addRow(self.btn_v2_settings)
         pick_form.addRow("Hilbert target", self.cmb_hilbert_target)
         pick_form.addRow("HILBERT_ONSET_PCT", self.spin_hilbert_onset_pct)
         pick_form.addRow("Pick order", self.cmb_pick_order)
         pick_form.addRow("Manual snap win ms", self.spin_manual_snap)
+        pick_form.addRow("Max negative jump (ms)", self.spin_max_neg_jump)
         pick_form.addRow(self.btn_pick_toggle)
         pick_form.addRow(self.btn_auto_pick)
         pick_form.addRow(self.btn_save_picks)
@@ -891,6 +1039,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_next.clicked.connect(self.next_shot)
         self.btn_pick_toggle.clicked.connect(self._toggle_pick_mode)
         self.btn_auto_pick.clicked.connect(self._auto_pick_current_shot)
+        self.btn_v2_settings.clicked.connect(self._edit_v2_picker_settings)
         self.btn_save_picks.clicked.connect(self._save_picks_current_profile)
         self.btn_clear_picks.clicked.connect(self._clear_current_shot_picks)
         self.btn_run_analysis.clicked.connect(self._run_interactive_analysis)
@@ -1055,6 +1204,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.settings.hilbert_onset_pct = float(self.spin_hilbert_onset_pct.value())
         self.settings.pick_order = self.cmb_pick_order.currentText().strip().upper()
         self.settings.manual_snap_win_ms = float(self.spin_manual_snap.value())
+        self.settings.max_negative_jump_ms = float(self.spin_max_neg_jump.value())
         self._render_current()
 
     def _on_geometry_changed(self, text: str):
@@ -1459,12 +1609,33 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         rp = self._receiver_positions_for_shot(shot)
         shot_pos = self._shot_geom_position(shot, rp)
         count = 0
+        rejected = 0
+
+        max_neg_jump = float(self.settings.max_negative_jump_ms)
+        _last_valid_ms: list = [None]
+
+        def _accept(trace_idx: int, ms: float) -> bool:
+            """Accept a candidate pick unless it jumps more than
+            `max_neg_jump` ms earlier than the previous trace's accepted
+            pick (traces processed in index order). Real first-break
+            travel time should not decrease much from one trace to the
+            next; a big drop almost always means the auto-picker latched
+            onto noise or an unrelated event on that one trace.
+            """
+            nonlocal rejected
+            prev = _last_valid_ms[0]
+            if prev is not None and (prev - ms) > max_neg_jump:
+                rejected += 1
+                return False
+            picks[trace_idx] = round(ms, 2)
+            _last_valid_ms[0] = ms
+            return True
 
         if mode == "picker_v2":
             raw_data = np.asarray(shot.data, dtype=np.float64)
             offsets_m = [float(rp[i]) - float(shot_pos) if i < len(rp) else 0.0
                         for i in range(raw_data.shape[0])]
-            v2_settings = PickerSettingsV2()
+            v2_settings = self._v2_settings
             v2_picker = FirstBreakPickerV2(settings=v2_settings)
             try:
                 v2_results = v2_picker.pick_profile(raw_data, dt_s, offsets_m=offsets_m)
@@ -1509,8 +1680,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                         found = k
                         break
                 if found is not None:
-                    picks[i] = round(t0 + found * shot.dt_ms, 2)
-                    count += 1
+                    if _accept(i, t0 + found * shot.dt_ms):
+                        count += 1
         elif mode == "maxdiff_zero":
             for i in range(prepared.shape[0]):
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
@@ -1523,8 +1694,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                     use_abs_peak=True,
                 )
                 if zt is not None:
-                    picks[i] = round(t0 + zt * 1000.0, 2)
-                    count += 1
+                    if _accept(i, t0 + zt * 1000.0):
+                        count += 1
         else:
             for i in range(prepared.shape[0]):
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
@@ -1541,10 +1712,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 else:
                     ts = onset_s if onset_s is not None else peak_s
                 if ts is not None:
-                    picks[i] = round(t0 + float(ts) * 1000.0, 2)
-                    count += 1
+                    if _accept(i, t0 + float(ts) * 1000.0):
+                        count += 1
 
-        self.statusBar().showMessage(f"Auto-pick ({mode}): {count}/{shot.n_traces} placed")
+        self.statusBar().showMessage(
+            f"Auto-pick ({mode}): {count}/{shot.n_traces} placed"
+            + (f", {rejected} rejected (>{max_neg_jump:.0f}ms earlier than previous trace)" if rejected else "")
+        )
         self._render_current()
 
     def _set_pick_mode(self, enabled: bool):
@@ -2422,6 +2596,15 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             report_paths = [str(p) for p in self._discover_report_paths()]
             manual_geometry_paths = [str(p) for p in project.manual_geometry_files]
 
+            shot_pos_by_id = {sid: pos for sid, pos in a["shots_info"]}
+            raw_shots = {
+                idx + 1: (
+                    self.shots[idx].data, self.shots[idx].dt_ms / 1000.0,
+                    self.shots[idx].delay_ms, shot_pos_by_id.get(idx + 1, 0.0),
+                )
+                for idx in range(len(self.shots))
+            }
+
             result = export_full_analysis(
                 profile_name=a["profile"],
                 cfg=a["cfg"],
@@ -2440,6 +2623,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 po_sources=a.get("po_sources"),
                 picker_method=getattr(self, "_last_pick_method", "Interactive (manual)"),
                 finalize=True,
+                raw_shots=raw_shots,
+                qc_display_mode=self.settings.display_mode,
+                qc_clip_factor=self.settings.clip_factor,
+                qc_wiggle_scale=self.settings.wiggle_scale,
+                qc_cmap=self.settings.cmap,
             )
             project.register_profile(a["profile"])
             pio.save_project(project)

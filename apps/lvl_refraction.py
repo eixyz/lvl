@@ -468,7 +468,7 @@ def prompt_offset_model_by_shot(perp_by_shot: dict,
 from src.refraction.pipeline import AnalysisWorkflow
 
 def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
-                                  title: str) -> dict:
+                                  title: str, initial_windows: list | None = None) -> dict:
     """
         Let user pick up to 6 x-boundaries on a T-X plot:
             x1-x2 -> layer 1
@@ -477,6 +477,12 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
         Dedicated UI controls:
             LMB = add point, MMB = delete nearest point, RMB-hold = preview trendline/apparent velocity,
             Undo = remove last, Save = continue, Skip = ignore side
+
+        `initial_windows`, if given, pre-populates the plot with a
+        previous session's boundary x-values (snapped to the nearest
+        actual data point on this curve) so resuming a profile shows
+        your earlier picks instead of a blank plot - Undo/re-click still
+        works normally from there.
     """
     try:
         backend = str(plt.get_backend()).lower()
@@ -669,6 +675,22 @@ def _pick_layer_windows_from_plot(x_vals: Any, t_vals: Any,
             "x5-x6: layer3\n\n"
             f"Selected points:\n{sel}"
         )
+
+    if initial_windows:
+        for xv in initial_windows:
+            if xv is None:
+                continue
+            try:
+                xv = float(xv)
+            except Exception:
+                continue
+            idx_nearest = int(np.argmin(np.abs(np.asarray(x_vals, dtype=float) - xv)))
+            state["xs"].append(float(x_vals[idx_nearest]))
+            state["ts"].append(float(t_vals[idx_nearest]))
+        if state["xs"]:
+            _redraw_selected_markers()
+            _update_info()
+            fig.canvas.draw_idle()
 
     def _finish(skip: bool):
         if state["done"]:
@@ -1063,9 +1085,13 @@ def pick_layer_windows_interactive(profile_name: str,
             t = np.array([r["fb_interp_inline_ms"] for r in side_rows], dtype=float)
             title = f"Profile {profile_name} | Shot {shot_id} | Side {side}"
             print(f"     Opening layer-window picker: Shot {shot_id} Side {side}")
+            prev_side = (existing.get(int(shot_id), {}) or {}).get(side) or {}
+            prev_windows = prev_side.get("windows")
+            if prev_windows and any(w is not None for w in prev_windows):
+                print(f"     Resuming Shot {shot_id} Side {side} from previously saved boundaries.")
 
             while True:
-                pick_payload = _pick_layer_windows_from_plot(x, t, title)
+                pick_payload = _pick_layer_windows_from_plot(x, t, title, initial_windows=prev_windows)
                 windows = pick_payload.get("windows", [None, None, None])
                 picked_points = pick_payload.get("picked_points", [])
 

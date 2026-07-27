@@ -243,12 +243,23 @@ def normalize_trace(trace: Any) -> Any:
     return (x / mx).astype(np.float32)
 
 
-def clip_outliers(trace: Any, n_std: float = 5.0) -> Any:
-    """Clip samples beyond `n_std` standard deviations (spike suppression)."""
+def clip_outliers(trace: Any, n_std: float = 8.0, reference_std: float | None = None) -> Any:
+    """Clip samples beyond `n_std` standard deviations (spike suppression).
+
+    If `reference_std` is given, it's used as the "1 std" scale instead of
+    the whole trace's own std. This matters a lot for seismic data: the
+    genuine first-break arrival is often a large fraction of a trace's
+    total energy, not a rare blip, so clipping relative to the *whole
+    trace's* std can clip the real signal itself down to a fraction of
+    its amplitude - which is exactly backwards, and was making picking
+    worse, not more robust. Pass the pre-shot noise window's std here
+    (see `estimate_noise_window`) so only genuine spikes relative to the
+    noise floor get clipped, not the arrival waveform.
+    """
     x = np.asarray(trace, dtype=np.float64)
     if x.size == 0:
         return x.astype(np.float32)
-    std = float(np.std(x))
+    std = float(reference_std) if reference_std is not None else float(np.std(x))
     if std < 1e-20:
         return x.astype(np.float32)
     limit = n_std * std
@@ -302,8 +313,10 @@ def preprocess_trace(
     dt_s: float,
     remove_dc_flag: bool = True,
     remove_trend_flag: bool = False,
-    clip_flag: bool = True,
-    clip_n_std: float = 5.0,
+    clip_flag: bool = False,
+    clip_n_std: float = 8.0,
+    clip_reference: str = "noise",  # "noise" | "trace"
+    noise_fraction: float = 0.1,
     bandpass: bool = False,
     f1: float = BP_F1, f2: float = BP_F2, f3: float = BP_F3, f4: float = BP_F4,
     normalize: bool = False,
@@ -313,10 +326,23 @@ def preprocess_trace(
     Order: remove DC -> (optional) detrend -> (optional) clip outliers ->
     (optional) Ormsby bandpass -> (optional) normalize.
 
-    All steps are opt-out (not opt-in) except detrend/bandpass/normalize,
-    which default off: detrending and amplitude normalization can distort
-    the energy/SNR/AGC-sensitive features downstream, so they're only
-    applied if the caller explicitly asks for them.
+    All steps are opt-out (not opt-in) except detrend/clip/bandpass/
+    normalize, which default off. `clip_flag` in particular defaults off
+    on purpose: it was clipping genuine high-SNR arrivals (a strong,
+    clean first break can legitimately be 10-30x the noise-window std,
+    which isn't an "outlier" to suppress - it's the signal being picked).
+    Enable it only if your data has known instrument-glitch spikes
+    distinct from the arrival itself. Detrending and amplitude
+    normalization can distort the energy/SNR/AGC-sensitive features
+    downstream, so they're also opt-in.
+
+    `clip_reference="noise"` (default) computes the clip threshold from
+    the estimated pre-shot noise window's std, not the whole trace's -
+    using the whole trace clips the genuine arrival waveform itself on
+    any trace where the signal is a large fraction of total energy,
+    which is common and actively hurts picking. Use "trace" only if you
+    know the noise-window estimate is unreliable for your data (e.g. no
+    real pre-trigger silence).
     """
     x = np.asarray(trace, dtype=np.float64)
     if x.size == 0:
@@ -327,7 +353,14 @@ def preprocess_trace(
     if remove_trend_flag:
         x = remove_trend(x)
     if clip_flag:
-        x = clip_outliers(x, n_std=clip_n_std)
+        ref_std = None
+        if clip_reference == "noise":
+            _, noise_end_s = estimate_noise_window(x, dt_s, noise_fraction)
+            noise_end_sample = max(2, int(round(noise_end_s / dt_s)))
+            noise_segment = x[:min(noise_end_sample, x.size)]
+            if noise_segment.size >= 2:
+                ref_std = float(np.std(noise_segment))
+        x = clip_outliers(x, n_std=clip_n_std, reference_std=ref_std)
     if bandpass:
         x = ormsby(x, dt_s, f1=f1, f2=f2, f3=f3, f4=f4)
     if normalize:

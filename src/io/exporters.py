@@ -69,16 +69,18 @@ def export_processing_report(
     raw_folder: Path | str | None = None,
     picker_method: str | None = None,
     output_files: list | None = None,
+    parameters: dict | None = None,
     filename_suffix: str = "",
 ) -> Path:
     """Write a human-readable processing_report.md for one profile.
 
     This exists purely for traceability/handover: which geometry file,
-    field-report file, and coordinate file were actually used to process
-    this profile, with what parameters, producing what results - so
-    someone looking at `results/reports/<profile>/` six months from now
-    (or a colleague who didn't run the processing themselves) can see
-    exactly what went into it without re-deriving it from picks.json.
+    field-report file, and coordinate file were actually MATCHED and used
+    to process this profile (not every candidate file that happened to be
+    searched), with what parameters, producing what results - so someone
+    looking at `results/reports/<profile>/` six months from now (or a
+    colleague who didn't run the processing themselves) can see exactly
+    what went into it without re-deriving it from picks.json.
     """
     out_dir = report_directory(profile_name)
     out_path = out_dir / f"{profile_name}_processing_report{filename_suffix}.md"
@@ -86,7 +88,7 @@ def export_processing_report(
     def _fmt_paths(paths) -> str:
         paths = [p for p in (paths or []) if p]
         if not paths:
-            return "(none)"
+            return "(none matched)"
         return "\n".join(f"- `{p}`" for p in paths)
 
     def _fmt_by_shot(d: dict, unit: str) -> str:
@@ -105,20 +107,30 @@ def export_processing_report(
         f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}",
         f"Picker method: {picker_method or '(not recorded)'}",
         "",
-        "## Parameters",
+        "## Parameters used",
         f"- Geometry type: {cfg.get('geom', '?')}",
         f"- Line number: {cfg.get('line_no', profile_name)}",
+    ]
+    for key, val in (parameters or {}).items():
+        if key in ("geom_type", "line_no"):
+            continue  # already shown above
+        lines.append(f"- {key}: {val}")
+    lines += [
         "",
-        "## Input files used",
-        f"Raw SEG2 folder: `{raw_folder}`" if raw_folder else "Raw SEG2 folder: (not recorded)",
+        "## Input files actually used",
+        "(files that were searched but did not match this profile are not listed)",
         "",
-        "Geometry/coordinate files (auto-discovered + manually uploaded):",
+    ]
+    if raw_folder:
+        lines += [f"Raw SEG2 folder: `{raw_folder}`", ""]
+    lines += [
+        "Geometry/coordinate file(s) matched:",
         _fmt_paths(geometry_paths),
         "",
-        "Manually uploaded geometry files (subset of the above, always searched first):",
+        "Manually uploaded geometry files consulted (subset of the above, if any matched):",
         _fmt_paths(manual_geometry_paths),
         "",
-        "Field-report files (perpendicular-offset source):",
+        "Field-report file(s) that provided a perpendicular offset:",
         _fmt_paths(report_paths),
         "",
         "## Perpendicular offset (PO) by shot",
@@ -1569,3 +1581,118 @@ def export_layer_fit_rms_plot(profile_name: str,
     plt.close(fig)
     print(f"  layer_fit -> {_project().relative(out)}")
     return out
+
+
+def export_shot_qc_plot(
+    profile_name: str,
+    shot_id: int,
+    data: Any,
+    dt_s: float,
+    delay_ms: float,
+    picks: dict,
+    recv_positions: Any = None,
+    shot_pos_m: float | None = None,
+    theme: str = "light",
+    filename_suffix: str = "",
+    display_mode: str = "both",
+    clip_factor: float = 2.0,
+    wiggle_scale: float = 1.0,
+    cmap: str = "gray",
+) -> Path:
+    """Save a per-shot QC plot with picks marked - proof, for anyone
+    reviewing the results later, that a given shot's picks were placed on
+    genuine arrivals and not somewhere spurious.
+
+    Uses the SAME variable-density + wiggle rendering convention as the
+    interactive `SeismicDisplay` widget in lvl_studio.py (robust per-trace
+    std normalization with median clipping, positive-lobe fill, VD
+    background at the 98th-percentile amplitude scale) - not a simplified
+    stand-in, so the saved plot actually looks like what you saw on
+    screen while picking, not a generic line plot.
+
+    This is the plot the legacy interactive v1 picker used to save
+    automatically as part of its own matplotlib window (`{profile}_shot
+    {id:02d}_picks.png`); the PyQt desktop picking view and Picker V2
+    auto-pick don't go through that window, so nothing was producing it
+    for those workflows - this closes that gap, in the same naming
+    convention, callable from anywhere picks exist for a shot.
+
+    Parameters
+    ----------
+    data : Any
+        (n_traces, n_samples) array for this shot.
+    picks : dict
+        {trace_index (1-based): pick_time_ms}.
+    display_mode : str
+        "wiggle", "vd", or "both" - matches the GUI's own display-mode setting.
+    """
+    c = theme_colors(theme)
+    x = np.asarray(data, dtype=np.float64)
+    n_traces, n_samples = x.shape
+    t_ms = delay_ms + np.arange(n_samples) * dt_s * 1000.0
+    xv = np.arange(1, n_traces + 1, dtype=float)  # trace-index x positions
+    dx = 1.0  # spacing between adjacent trace positions
+
+    fig, ax = plt.subplots(figsize=(10, 7), constrained_layout=False)
+    fig.patch.set_facecolor(c["fig_bg"])
+    ax.set_facecolor(c["ax_bg"])
+
+    mode = str(display_mode).strip().lower()
+
+    if mode in ("vd", "both"):
+        vmax = float(np.percentile(np.abs(x), 98)) if x.size else 1.0
+        if vmax < 1e-12:
+            vmax = 1.0
+        ax.imshow(
+            x.T, cmap=cmap, aspect="auto", interpolation="nearest",
+            vmin=-vmax, vmax=vmax,
+            extent=[xv[0] - dx / 2, xv[-1] + dx / 2, float(t_ms[-1]), float(t_ms[0])],
+            alpha=0.45 if mode == "both" else 1.0, zorder=1,
+        )
+
+    if mode in ("wiggle", "both"):
+        # Robust per-trace normalization: clip each trace's std to
+        # [0.3, 3.0] x the profile's median std, so one dead/noisy trace
+        # doesn't wash out or dwarf its neighbours - matches the GUI.
+        stds = x.std(axis=1).astype(float)
+        valid = stds[stds > 1e-20]
+        med = float(np.median(valid)) if valid.size else 1.0
+        norms = np.clip(stds, med * 0.3, med * 3.0)
+        norms = np.where(norms > 1e-20, norms, med)
+        scale = norms * float(clip_factor)
+        defl = dx * float(wiggle_scale)
+        trace_col = c["tick"]
+        for i in range(n_traces):
+            base_x = float(xv[i])
+            tr_n = np.clip(x[i] / scale[i], -1.0, 1.0)
+            wig_x = base_x + tr_n * defl
+            ax.plot(wig_x, t_ms, color=trace_col, linewidth=0.5, alpha=0.85, zorder=4)
+            pos = np.where(tr_n > 0.0, tr_n, 0.0)
+            ax.fill_betweenx(t_ms, base_x, base_x + pos * defl, color=trace_col, alpha=0.18, zorder=3)
+
+    if picks:
+        pick_x = sorted(int(k) for k in picks.keys())
+        pick_y = [float(picks[k]) for k in pick_x]
+        ax.plot(pick_x, pick_y, "o-", color="#e63946", ms=4, lw=1.2, zorder=5, label="Picks")
+        ax.legend(loc="upper right", fontsize=8, facecolor=c["ax_bg"], labelcolor=c["text"])
+
+    title = f"Profile {profile_name} - Shot {shot_id}"
+    if shot_pos_m is not None:
+        title += f" (SP={float(shot_pos_m):.1f} m)"
+    ax.set_title(title, color=c["text"], fontsize=11)
+    ax.set_xlabel("Trace index", color=c["label"])
+    ax.set_ylabel("Time (ms)", color=c["label"])
+    ax.set_xlim(xv[0] - dx, xv[-1] + dx)
+    ax.invert_yaxis()
+    ax.grid(True, lw=0.3, alpha=0.3, color=c["grid"])
+    ax.tick_params(colors=c["tick"])
+    for sp in ax.spines.values():
+        sp.set_edgecolor(c["spine"])
+
+    out_dir = plots_directory(profile_name)
+    out_path = out_dir / f"{profile_name}_shot{int(shot_id):02d}_picks{filename_suffix}.png"
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=150, facecolor=c["fig_bg"])
+    plt.close(fig)
+    print(f"  QC picks plot -> {_project().relative(out_path)}")
+    return out_path

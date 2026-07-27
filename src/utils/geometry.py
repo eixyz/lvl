@@ -218,7 +218,7 @@ def _find_station_xyz_columns(df: Any) -> tuple | None:
                 i_x = ci
             if i_y is None and txt in ("y", "north", "northing"):
                 i_y = ci
-            if i_z is None and (txt == "z" or "height" in txt or "elevation" in txt):
+            if i_z is None and (txt == "z" or "height" in txt or "ortho height" in txt):
                 i_z = ci
 
         if None not in (i_profile, i_station, i_x, i_y, i_z):
@@ -624,19 +624,16 @@ def load_profile_offsets_from_excel(
     perp_by_shot: dict = {}
     shift_by_shot: dict = {}
 
-    # Many field sheets use column A as shot index (1/2/3).
-    shot_numbers = [int(r["ffid"]) for r in rows_target if r.get("ffid") is not None]
-    if shot_numbers:
-        uniq = sorted(set(shot_numbers))
-        if uniq and min(uniq) >= 1 and max(uniq) <= max(10, len(rows_target) + 1):
-            for row in rows_target:
-                sid = row.get("ffid")
-                if sid is None:
-                    continue
-                perp_by_shot[int(sid)] = float(row["perp"])
-                shift_by_shot[int(sid)] = float(row["shift"])
-            return perp_by_shot, shift_by_shot
-
+    # Prefer the unambiguous route: translate each row's real FFID to its
+    # internal shot_id via `ffid_to_shots` (built from the FFID actually
+    # read out of each shot's SEG2 file - see `_load_perp_overrides` in
+    # lvl_studio.py). This must run BEFORE the "column A looks like a
+    # small sequential shot index" heuristic below: a real FFID can
+    # easily be small too (a profile whose kept shots start at FFID 5,
+    # 6, 7 after discarding early test shots satisfies "min>=1, max<=10"
+    # just as well as genuine 1/2/3 shot-order values would), and in that
+    # case the heuristic would silently apply every PO to the wrong
+    # internal shot_id, with everything defaulting to PO=0.0.
     if ffid_to_shots:
         ffid_cursor: dict = {k: 0 for k in ffid_to_shots}
         for row in rows_target:
@@ -652,7 +649,29 @@ def load_profile_offsets_from_excel(
             ffid_cursor[ff_key] = cur + 1
             perp_by_shot[int(sid)] = float(row["perp"])
             shift_by_shot[int(sid)] = float(row["shift"])
-    else:
+        if perp_by_shot:
+            return perp_by_shot, shift_by_shot
+        # ffid_to_shots was given but nothing in the sheet matched any
+        # real FFID - fall through to the heuristic rather than silently
+        # returning empty, in case the sheet genuinely uses 1/2/3-style
+        # shot-order numbering instead of real FFID.
+
+    # Fallback (no ffid_to_shots given, or it matched nothing): many field
+    # sheets use column A as a simple shot index (1/2/3) rather than the
+    # real FFID. Only safe to assume this when we have no better mapping.
+    shot_numbers = [int(r["ffid"]) for r in rows_target if r.get("ffid") is not None]
+    if shot_numbers:
+        uniq = sorted(set(shot_numbers))
+        if uniq and min(uniq) >= 1 and max(uniq) <= max(10, len(rows_target) + 1):
+            for row in rows_target:
+                sid = row.get("ffid")
+                if sid is None:
+                    continue
+                perp_by_shot[int(sid)] = float(row["perp"])
+                shift_by_shot[int(sid)] = float(row["shift"])
+            return perp_by_shot, shift_by_shot
+
+    if not perp_by_shot:
         for i, row in enumerate(rows_target, start=1):
             perp_by_shot[int(i)] = float(row["perp"])
             shift_by_shot[int(i)] = float(row["shift"])
