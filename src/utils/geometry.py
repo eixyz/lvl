@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import datetime
 import math
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -329,16 +330,29 @@ def load_profile_geometry_from_excels(profile_name: str,
         s = str(v).strip()
         if not s:
             return None
-        for fmt in (
-            "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
-            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
-            "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-            "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d",
-        ):
-            try:
-                return datetime.datetime.strptime(s, fmt)
-            except Exception:
-                continue
+
+        # Strip a trailing timezone label ("GMT+01:0", "GMT+01:00", "UTC",
+        # "CET", ...) - real exports aren't always well-formed enough for
+        # %z (a single-digit offset minute like "+01:0" isn't valid %z
+        # input anyway), and for a processing-report timestamp the local
+        # wall-clock time matters far more than reconstructing the exact
+        # UTC instant.
+        s_clean = re.sub(r"\s*(GMT|UTC)\s*[+-]?\d{0,2}:?\d{0,2}\s*$", "", s, flags=re.IGNORECASE).strip()
+        s_clean = re.sub(r"\s+[A-Za-z]{2,5}$", "", s_clean).strip() if s_clean == s else s_clean
+
+        for candidate in (s_clean, s):
+            for fmt in (
+                "%d.%m.%Y %H:%M:%S.%f", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+                "%d/%m/%Y %H:%M:%S.%f", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+                "%m/%d/%Y %H:%M:%S.%f", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%d.%m.%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d",
+            ):
+                try:
+                    return datetime.datetime.strptime(candidate.strip(), fmt)
+                except Exception:
+                    continue
         return None
 
     def _extract_sheet_acq_datetime_de(df: Any, hdr_row: int) -> str | None:
@@ -353,7 +367,7 @@ def load_profile_geometry_from_excels(profile_name: str,
                 dt_local = dt_val.astimezone(tz)
             return dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-        labels = ("datum", "date", "acquisition")
+        labels = ("datum", "date", "acquisition", "time")
         for r in range(max_rows):
             for c in range(max_cols):
                 txt = str(df.iat[r, c] if c < df.shape[1] else "").strip().lower()
