@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from src.common.settings import (
     STA_MS, LTA_MS, HILBERT_ONSET_PCT,
+    AUTO_USE_VELOCITY_GATE, AUTO_VMIN_M_S, AUTO_VMAX_M_S, AUTO_GATE_PAD_MS,
 )
 
 
@@ -38,6 +39,10 @@ class PickerSettings:
     sta_window: float = STA_MS            # ms
     lta_window: float = LTA_MS            # ms
     hilbert_onset_pct: float = HILBERT_ONSET_PCT
+    use_velocity_gate: bool = AUTO_USE_VELOCITY_GATE
+    vmin_m_s: float = AUTO_VMIN_M_S
+    vmax_m_s: float = AUTO_VMAX_M_S
+    gate_pad_ms: float = AUTO_GATE_PAD_MS
 
     coherence_radius: int = 2             # number of neighbouring traces each side
     coherence_align: bool = True          # shift-align neighbours before semblance (real moveout)

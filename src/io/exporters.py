@@ -263,9 +263,14 @@ def export_velocity_summary_excel(profile_name: str,
         if sx is not None and sy is not None and sz is not None:
             x_mid, y_mid, z_mid = float(sx), float(sy), float(sz)
             src = "SEG2(mid-shot)"
-    if acq_dt_excel:
+    # Acquisition date/time priority: SEG2 header first (passed in as
+    # `acquisition_time_de`), and only fall back to the coordinate/field
+    # Excel value when the SEG2 file did not provide one.
+    if not acq_dt_final and acq_dt_excel:
         acq_dt_final = acq_dt_excel
-    elif len(recv_positions) >= 1:
+    # Coordinate fallback: if the coordinate workbook did not yield a
+    # midpoint XYZ above, try the nearest-station lookup instead.
+    if x_mid is None and len(recv_positions) >= 1:
         station_mid = (0.5 + (float(len(recv_positions)) + 0.5)) / 2.0
         x_mid, y_mid, z_mid, src = load_midpoint_xyz_from_geometry_excels(
             profile_name,

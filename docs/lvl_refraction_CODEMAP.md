@@ -1,39 +1,151 @@
-# lvl_refraction.py - Full Function Documentation
+# LVL Code Map
 
-User-facing run/field interpretation guide:
-- lvl/scripts/lvl_refraction_INSTRUCTIONS.md
-- lvl/scripts/lvl_studio_INSTRUCTIONS.md
+This document is the developer handoff map for the current refactored LVL codebase.
 
-Project purpose overview:
-- lvl/README.md
+It is no longer a single-file `lvl_refraction.py` project. The current rule is:
 
-Standalone GUI command center (single GUI module):
-- lvl/scripts/lvl_command_center.py
+- `apps/` owns UI shells, app startup, and orchestration
+- `src/` owns reusable processing, picker, IO, and export logic
 
-Independent workstation app (new program):
-- lvl/scripts/lvl_studio.py
+## Current entry points
 
-Shared module layer (GUI/backend decoupling):
-- lvl/scripts/lvl_modules/app_paths.py
-- lvl/scripts/lvl_modules/run_config.py
-- lvl/scripts/lvl_modules/control_bridge.py
+- `apps/lvl_studio.py`
+  - primary workstation GUI
+  - best first file for GUI, manual picking, auto-pick integration, dock layout, and project workflow issues
+- `apps/lvl_refraction.py`
+  - CLI / interactive-analysis entry point using the shared backend
 
-Removed legacy GUI variants:
-- lvl/scripts/lvl_gui_pyqt.py
-- lvl/scripts/lvl_refraction_gui_support.py
+## Dependency map
 
-This document explains why each major function/class exists in `lvl_refraction.py` and where it fits in the workflow.
+### 1. Desktop GUI path
 
-The script is organized as:
-1. Environment and dependencies
-2. Configuration
-3. Geometry/report parsing helpers
-4. Offset model setup UI (matplotlib)
-5. Signal processing and picking analysis
-6. Interactive picker class
-7. Persistence helpers (JSON)
-8. Export functions (TXT/Excel/plots)
-9. Main pipeline + CLI
+- `apps/lvl_studio.py`
+  - project open/create/settings -> `src/io/project_io.py`
+  - SEG2 read / acquisition date / midpoint XYZ -> `src/io/seg2_reader.py`
+  - imported pick layers / session persistence -> `src/io/pick_reader.py`
+  - filtering/gain helpers -> `src/picker/preprocessing.py`
+  - Hilbert and feature helpers -> `src/picker/features.py`
+  - zero-crossing / onset refinement -> `src/picker/refinement.py`
+  - Picker Engine V2 facade -> `src/picker/picker.py`
+  - V2 tunables -> `src/picker/settings.py`
+  - full analysis/export orchestration -> `src/refraction/pipeline.py`
+  - shot/layer summaries -> `src/refraction/layer_analysis.py`, `src/refraction/velocity_model.py`
+  - final report/workbook/plot export -> `src/io/exporters.py`
+
+### 2. Picker Engine V2 path
+
+- `src/picker/picker.py`
+  - preprocess one trace -> `src/picker/preprocessing.py`
+  - compute normalized feature curves -> `src/picker/features.py`
+  - fuse per-trace likelihood -> `src/picker/likelihood.py`
+  - reinforce with neighbour coherence -> `src/picker/coherence.py`
+  - choose gather-wide smooth path -> `src/picker/optimizer.py`
+  - score confidence / flags -> `src/picker/confidence.py`
+  - physics-level validation -> `src/picker/quality.py`
+
+### 3. Refraction analysis path
+
+- `src/refraction/pipeline.py`
+  - corrected travel-time tables -> `src/refraction/processing.py`
+  - layer fits and payload assembly -> `src/refraction/layer_analysis.py`
+  - averaged velocity/depth summaries -> `src/refraction/velocity_model.py`
+  - output files -> `src/io/exporters.py`
+
+## Where to start by issue type
+
+- Auto-pick is placing picks on the wrong sample but the right trace region:
+  - start in `apps/lvl_studio.py`
+  - key functions: `_auto_pick_current_shot`, `_auto_gate_local_s`, `_refine_v2_pick_time_ms`
+  - then inspect `src/picker/picker.py`, `src/picker/likelihood.py`, `src/picker/optimizer.py`
+- V2 feature/likelihood quality is poor before GUI refinement:
+  - start in `src/picker/features.py` and `src/picker/likelihood.py`
+- Gather-wide V2 picks are smooth but shifted/late:
+  - start in `src/picker/optimizer.py`, then back to GUI refinement in `apps/lvl_studio.py`
+- Manual click snapping is wrong:
+  - start in `_snap_pick_time_ms` in `apps/lvl_studio.py`
+- Export/report fields are wrong:
+  - start in `src/io/exporters.py` and `src/refraction/pipeline.py`
+- Project paths/recent projects/session directories are wrong:
+  - start in `src/io/project_io.py` and `apps/lvl_studio.py`
+
+## Critical functions in the GUI shell
+
+- `LvlStudioWindow._build_ui`
+  - creates the dock/toolbox controls and picking widgets
+  - safe place for layout/width/UI-only changes
+- `LvlStudioWindow._edit_v2_picker_settings`
+  - single source of truth for exposed V2 parameter ranges in the desktop UI
+- `LvlStudioWindow._auto_gate_local_s`
+  - gate builder used by all studio auto-pick modes
+  - if picks are late/too early outside the plausible arrival zone, inspect here first
+- `LvlStudioWindow._auto_pick_current_shot`
+  - integration layer between studio UX and legacy/V2 pick modes
+  - this is the best first stop when a mode skips traces or behaves differently from the GUI expectation
+- `LvlStudioWindow._refine_v2_pick_time_ms`
+  - converts V2's chosen arrival region into the final first-arrival sample used in the studio
+  - this is the critical function for "right side of arrival, wrong exact onset" problems
+
+## Critical functions in Picker Engine V2
+
+- `src/picker/features.py::extract_features`
+  - computes the normalized per-sample feature curves
+- `src/picker/likelihood.py::compute_arrival_likelihood`
+  - fuses the feature curves into one per-trace arrival-likelihood curve
+- `src/picker/coherence.py::compute_trace_coherence`
+  - adds cross-trace reinforcement without replacing the single-trace evidence
+- `src/picker/optimizer.py::optimize_profile`
+  - turns per-trace candidates into one smooth gather-wide pick path
+- `src/picker/confidence.py::estimate_confidence`
+  - summarizes pick trustworthiness for review/flagging
+- `src/picker/quality.py::quality_report`
+  - adds physics-based gather checks after picks exist
+
+## Picker V2 parameter reference and ranges
+
+The desktop dialog currently exposes these ranges:
+
+- Feature weights
+  - `hilbert_weight`, `stalta_weight`, `aic_weight`, `gradient_weight`, `energy_weight`, `snr_weight`, `kurtosis_weight`, `skewness_weight`: `0.0 .. 5.0`
+- Processing
+  - `sta_window`: `0.1 .. 100.0 ms`
+  - `lta_window`: `0.5 .. 500.0 ms`
+  - `hilbert_onset_pct`: `0.0 .. 1.0`
+- Coherence
+  - `coherence_weight`: `0.0 .. 1.0`
+  - `coherence_radius`: `1 .. 10`
+  - `coherence_align`: `True/False`
+  - `coherence_max_shift`: `1 .. 200` samples
+- Velocity gate
+  - `use_velocity_gate`: `True/False`
+  - `vmin_m_s`: `1 .. 20000`
+  - `vmax_m_s`: `1 .. 20000`
+  - `gate_pad_ms`: `0 .. 500 ms`
+- Path/confidence
+  - `smoothness_penalty`: `0.0 .. 5.0`
+  - `jump_penalty`: `0.0 .. 5.0`
+  - `minimum_confidence`: `0.0 .. 1.0`
+
+## Remove / replace guidance
+
+- Safe to change:
+  - UI labels, widget widths, dock layout, menu wiring in `apps/lvl_studio.py`
+  - documentation and report wording in `src/io/exporters.py`
+- Change carefully:
+  - `_auto_pick_current_shot` in `apps/lvl_studio.py` because it binds GUI expectations to both legacy and V2 pickers
+  - `src/picker/optimizer.py` because small penalty/candidate changes affect whole gathers
+  - `src/refraction/pipeline.py` because it controls the end-to-end export contract
+- Do not duplicate elsewhere:
+  - SEG2 parsing
+  - pick/session persistence
+  - feature extraction / likelihood fusion / coherence / optimizer stages
+  - refraction math and layer aggregation
+
+## Minimal runtime flow
+
+1. `apps/lvl_studio.py` loads a project and shot gathers.
+2. Auto/manual picking updates in-memory picks for the active layer.
+3. `src/refraction/pipeline.py` converts picks into corrected travel-time products and exports.
+4. `src/io/exporters.py` writes workbook, TXT, QC plots, and processing report.
 
 ## 1) Environment and setup
 

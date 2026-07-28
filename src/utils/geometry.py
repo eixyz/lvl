@@ -219,7 +219,7 @@ def _find_station_xyz_columns(df: Any) -> tuple | None:
                 i_x = ci
             if i_y is None and txt in ("y", "north", "northing"):
                 i_y = ci
-            if i_z is None and (txt == "z" or "height" in txt or "ortho height" in txt):
+            if i_z is None and (txt == "z" or "height" in txt or "elevation" in txt):
                 i_z = ci
 
         if None not in (i_profile, i_station, i_x, i_y, i_z):

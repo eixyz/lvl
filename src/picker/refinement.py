@@ -129,7 +129,12 @@ def first_significant_extremum_zero_crossing(
         n1 = min(x.size - 1, int(np.ceil(noise_win_end_s / dt_s)))
         noise_seg = x[n0:n1 + 1] if n1 > n0 else seg
         floor = float(np.std(noise_seg)) if noise_seg.size >= 2 else float(np.std(seg))
-        threshold = max(threshold_ratio * float(np.max(np.abs(seg))), 4.0 * floor)
+        # Noise-relative threshold is more sensitive and more physically
+        # meaningful than a window-max-relative one when a real pre-shot
+        # noise window is available - use it directly rather than
+        # whichever of the two is larger (which would just fall back to
+        # the less sensitive one and miss a genuinely weak first onset).
+        threshold = 4.0 * floor
     else:
         threshold = threshold_ratio * float(np.max(np.abs(seg)))
 

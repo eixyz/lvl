@@ -32,7 +32,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # Importing directories / project system
 from src.common import paths as core_paths
 from src.common.paths import GEOM_TEMPLATES_DIR, ASSETS_DIR
-from src.common.settings import APP_NAME, APP_VERSION, GEOM_FILES
+from src.common.settings import (
+    APP_NAME, APP_VERSION, GEOM_FILES, STA_MS, LTA_MS, STALTA_TRIG,
+    AUTO_VMIN_M_S, AUTO_VMAX_M_S, AUTO_GATE_PAD_MS,
+)
 from src.io import project_io as pio
 
 # Everything below is imported directly from src/ - lvl_studio.py has no
@@ -53,7 +56,7 @@ from src.picker.preprocessing import (
     apply_cutpass_all_params,
     apply_gain,
 )
-from src.picker.refinement import _zero_crossing_from_extremum_samples
+from src.picker.refinement import _zero_crossing_from_extremum_samples, first_significant_extremum_zero_crossing
 from src.picker.features import hilbert_envelope_pick
 from src.picker.picker import FirstBreakPicker as FirstBreakPickerV2
 from src.picker.settings import PickerSettings as PickerSettingsV2
@@ -62,6 +65,7 @@ from src.io.pick_reader import (
     load_layer_json, load_layer_session_json,
 )
 from src.io.exporters import export_velocity_summary_excel
+from src.io.seg2_reader import read_seg2_acquisition_time_de, read_seg2_mid_xyz
 from src.refraction.pipeline import AnalysisWorkflow, export_full_analysis
 from src.refraction.velocity_model import compute_layer_averages
 from src.refraction.layer_analysis import build_analysis_from_layers
@@ -150,6 +154,7 @@ class StudioSettings:
     f4: float = 180.0
     butter_order: int = 4
     auto_pick_mode: str = "hilbert_env"
+    pick_interaction_mode: str = "auto"  # "auto" = click snaps via method; "manual" = place exactly at click
     hilbert_target: str = "onset"
     hilbert_onset_pct: float = 0.08
     pick_order: str = "F>G>X"
@@ -347,7 +352,10 @@ class SeismicDisplay(QtWidgets.QWidget):
         if settings.invert_y_axis:
             self.ax.invert_yaxis()
         self.ax.margins(x=0.0, y=0.0)
-        self.ax.grid(bool(settings.show_grid), alpha=0.15)
+        if settings.show_grid:
+            self.ax.grid(True, alpha=0.15)
+        else:
+            self.ax.grid(False)
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
@@ -387,6 +395,11 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self._custom_geom_path: str | None = None
         self._view_xlim: tuple[float, float] | None = None
         self._view_ylim: tuple[float, float] | None = None
+        self.menu_recent: QtWidgets.QMenu | None = None
+        self._recent_projects_key = "recentProjects"
+        self._recent_projects_limit = 10
+        self._app_settings = QtCore.QSettings("LVL", "LVLStudio")
+        self._recent_projects = self._load_recent_projects()
 
         self._build_ui()
         self._build_actions()
@@ -471,8 +484,17 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        if hasattr(QtCore.Qt, "ScrollBarPolicy"):
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         inner = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(inner)
+        if hasattr(QtWidgets.QFormLayout, "FieldGrowthPolicy"):
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        form.setLabelAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft if hasattr(QtCore.Qt, "AlignmentFlag") else QtCore.Qt.AlignLeft
+        )
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
@@ -482,6 +504,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             sb.setSingleStep(step)
             sb.setDecimals(decimals)
             sb.setValue(value)
+            sb.setMaximumWidth(110)
             return sb
 
         form.addRow(QtWidgets.QLabel("<b>Feature weights</b> (relative; higher = trusted more)"))
@@ -508,7 +531,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         form.addRow(QtWidgets.QLabel("<b>Coherence</b> (cross-trace reinforcement)"))
         coh_weight = dspin(s.coherence_weight, 0.0, 1.0, 0.05, 2)
-        coh_radius = QtWidgets.QSpinBox(); coh_radius.setRange(1, 10); coh_radius.setValue(s.coherence_radius)
+        coh_radius = QtWidgets.QSpinBox(); coh_radius.setRange(1, 10); coh_radius.setValue(s.coherence_radius); coh_radius.setMaximumWidth(90)
         coh_align = QtWidgets.QCheckBox("Shift-align neighbours before comparing (recommended)")
         coh_align.setChecked(s.coherence_align)
         coh_align.setToolTip(
@@ -517,7 +540,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             "enough apart that the arrival shifts by more than a few samples "
             "between them (usually true for real data)."
         )
-        coh_max_shift = QtWidgets.QSpinBox(); coh_max_shift.setRange(1, 200); coh_max_shift.setValue(s.coherence_max_shift)
+        coh_max_shift = QtWidgets.QSpinBox(); coh_max_shift.setRange(1, 200); coh_max_shift.setValue(s.coherence_max_shift); coh_max_shift.setMaximumWidth(90)
         form.addRow("Coherence weight (0=off)", coh_weight)
         form.addRow("Coherence radius (neighbours/side)", coh_radius)
         form.addRow(coh_align)
@@ -525,10 +548,18 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
 
         form.addRow(QtWidgets.QLabel("<b>Velocity gate</b> (restricts picks to a physically plausible window per offset - prevents locking onto a later reflection/multiple)"))
         gate_on = QtWidgets.QCheckBox("Enabled (strongly recommended)")
-        gate_on.setChecked(s.use_velocity_gate)
-        gate_vmin = dspin(s.vmin_m_s, 1.0, 20000.0, 10.0, 1)
-        gate_vmax = dspin(s.vmax_m_s, 1.0, 20000.0, 50.0, 1)
-        gate_pad = dspin(s.gate_pad_ms, 0.0, 500.0, 5.0, 1)
+        gate_on.setChecked(getattr(s, "use_velocity_gate", True))
+        gate_vmin = dspin(getattr(s, "vmin_m_s", 120.0), 1.0, 20000.0, 10.0, 1)
+        gate_vmax = dspin(getattr(s, "vmax_m_s", 3500.0), 1.0, 20000.0, 50.0, 1)
+        gate_pad = dspin(getattr(s, "gate_pad_ms", 20.0), 0.0, 500.0, 5.0, 1)
+        if not hasattr(s, "use_velocity_gate"):
+            warn = QtWidgets.QLabel(
+                "<span style='color:#c0392b'>Warning: this installation's src/picker/settings.py "
+                "is out of date (missing the velocity-gate fields) - the values above are "
+                "temporary defaults and won't actually apply. Copy the latest src/picker/ files.</span>"
+            )
+            warn.setWordWrap(True)
+            form.addRow(warn)
         form.addRow(gate_on)
         form.addRow("Min apparent velocity (m/s)", gate_vmin)
         form.addRow("Max apparent velocity (m/s)", gate_vmax)
@@ -567,7 +598,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             coh_radius.setValue(defaults.coherence_radius)
             coh_align.setChecked(defaults.coherence_align)
             coh_max_shift.setValue(defaults.coherence_max_shift)
-            gate_on.setChecked(defaults.use_velocity_gate)
+            gate_on.setChecked(getattr(defaults, "use_velocity_gate", True))
 
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
@@ -623,6 +654,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def _set_project(self, project: "pio.Project"):
         self.project = project
         self.project.activate()
+        self._register_recent_project(project.root)
         self.current_profile = None
         self._update_window_title()
         self._current_folder = None
@@ -633,6 +665,99 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f"Project '{project.name}' open at {project.root}"
         )
+
+    def _load_recent_projects(self) -> list[str]:
+        raw = self._app_settings.value(self._recent_projects_key, [])
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif isinstance(raw, (list, tuple)):
+            candidates = [str(x) for x in raw]
+        else:
+            candidates = []
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            try:
+                resolved = str(Path(item).resolve())
+            except Exception:
+                continue
+            if not resolved or resolved in seen:
+                continue
+            if not Path(resolved).exists():
+                continue
+            seen.add(resolved)
+            cleaned.append(resolved)
+            if len(cleaned) >= self._recent_projects_limit:
+                break
+        return cleaned
+
+    def _save_recent_projects(self):
+        self._app_settings.setValue(self._recent_projects_key, self._recent_projects)
+        self._app_settings.sync()
+
+    def _register_recent_project(self, project_root: Path | str):
+        try:
+            root_str = str(Path(project_root).resolve())
+        except Exception:
+            return
+        if not root_str:
+            return
+
+        recents = [p for p in self._recent_projects if p != root_str and Path(p).exists()]
+        recents.insert(0, root_str)
+        self._recent_projects = recents[:self._recent_projects_limit]
+        self._save_recent_projects()
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        if self.menu_recent is None:
+            return
+
+        self.menu_recent.clear()
+        valid = [p for p in self._recent_projects if Path(p).exists()]
+        if valid != self._recent_projects:
+            self._recent_projects = valid
+            self._save_recent_projects()
+
+        if not self._recent_projects:
+            act_empty = QtGui.QAction("(No recent projects)", self)
+            act_empty.setEnabled(False)
+            self.menu_recent.addAction(act_empty)
+            return
+
+        for path_str in self._recent_projects:
+            path_obj = Path(path_str)
+            label = f"{path_obj.name} - {path_str}"
+            action = QtGui.QAction(label, self)
+            action.triggered.connect(lambda _checked=False, p=path_str: self._open_recent_project(p))
+            self.menu_recent.addAction(action)
+
+        self.menu_recent.addSeparator()
+        act_clear = QtGui.QAction("Clear Recent Projects", self)
+        act_clear.triggered.connect(self._clear_recent_projects)
+        self.menu_recent.addAction(act_clear)
+
+    def _open_recent_project(self, project_root: str):
+        try:
+            project = pio.open_project(project_root)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Open Recent Project",
+                f"Could not open project:\n{project_root}\n\n{exc}",
+            )
+            self._recent_projects = [p for p in self._recent_projects if p != project_root]
+            self._save_recent_projects()
+            self._rebuild_recent_menu()
+            return
+
+        self._set_project(project)
+
+    def _clear_recent_projects(self):
+        self._recent_projects = []
+        self._save_recent_projects()
+        self._rebuild_recent_menu()
 
     def _new_project_dialog(self):
         name, ok = QtWidgets.QInputDialog.getText(
@@ -860,15 +985,39 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.spin_butter_order.setValue(self.settings.butter_order)
 
         self.cmb_auto_mode = QtWidgets.QComboBox()
-        self.cmb_auto_mode.addItems(["stalta", "maxdiff_zero", "hilbert_env", "picker_v2"])
-        self.cmb_auto_mode.setCurrentText(self.settings.auto_pick_mode)
+        # Nicer display labels, with the canonical internal value stored as
+        # item data so the picking code keeps using stable keys.
+        for label, value in (
+            ("STA/LTA trigger", "stalta"),
+            ("Max-diff zero-crossing", "maxdiff_zero"),
+            ("Hilbert envelope", "hilbert_env"),
+            ("Picker Engine v2 (multi-feature)", "picker_v2"),
+        ):
+            self.cmb_auto_mode.addItem(label, value)
+        _mode_i = self.cmb_auto_mode.findData(self.settings.auto_pick_mode)
+        self.cmb_auto_mode.setCurrentIndex(_mode_i if _mode_i >= 0 else 0)
         self.cmb_auto_mode.setToolTip(
-            "stalta / maxdiff_zero / hilbert_env: legacy single-feature triggers.\n"
-            "picker_v2: full pipeline per shot - preprocessing -> features "
+            "STA/LTA / Max-diff zero-crossing / Hilbert envelope: single-feature triggers.\n"
+            "Picker Engine v2: full pipeline per shot - preprocessing -> features "
             "(Hilbert, STA/LTA, AIC, gradient, energy, SNR, kurtosis, skewness) "
             "-> likelihood fusion -> cross-trace coherence -> path optimization "
             "-> confidence/quality flags. Low-confidence picks are placed but "
             "flagged in the status bar for review, not silently dropped."
+        )
+        # Click behaviour: auto = snap the click to the arrival via the
+        # selected method; manual = drop the pick exactly where clicked.
+        self.cmb_click_mode = QtWidgets.QComboBox()
+        for label, value in (
+            ("Auto (snap click to arrival)", "auto"),
+            ("Manual (place exactly at click)", "manual"),
+        ):
+            self.cmb_click_mode.addItem(label, value)
+        _click_i = self.cmb_click_mode.findData(self.settings.pick_interaction_mode)
+        self.cmb_click_mode.setCurrentIndex(_click_i if _click_i >= 0 else 0)
+        self.cmb_click_mode.setToolTip(
+            "Auto: a mouse click is snapped to the first arrival using the "
+            "selected auto-pick method (within the manual snap window).\n"
+            "Manual: the pick is placed exactly where you click, no snapping."
         )
         self.btn_v2_settings = QtWidgets.QPushButton("Picker V2 Settings...")
         self.cmb_hilbert_target = QtWidgets.QComboBox()
@@ -910,6 +1059,29 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.btn_set_active_layer = QtWidgets.QPushButton("Set Active Layer")
         self.btn_remove_layer = QtWidgets.QPushButton("Remove Layer")
         self.lbl_active_layer = QtWidgets.QLabel("Active layer: Mine")
+
+        compact_inputs = [
+            self.spin_clip, self.spin_max_tr, self.spin_wiggle,
+            self.spin_tmin, self.spin_tmax, self.spin_trigger_static,
+            self.spin_extra_delay, self.spin_agc_window, self.spin_f1,
+            self.spin_f2, self.spin_f3, self.spin_f4, self.spin_butter_order,
+            self.spin_hilbert_onset_pct, self.spin_manual_snap, self.spin_max_neg_jump,
+        ]
+        for widget in compact_inputs:
+            widget.setMaximumWidth(118)
+
+        compact_combos = [
+            self.cmb_mode, self.cmb_x_axis, self.cmb_theme, self.cmb_cmap,
+            self.cmb_polarity, self.cmb_gain_mode, self.cmb_agc_stat,
+            self.cmb_filter_mode, self.cmb_auto_mode, self.cmb_click_mode,
+            self.cmb_hilbert_target, self.cmb_pick_order, self.cmb_geom_view,
+        ]
+        for widget in compact_combos:
+            widget.setMaximumWidth(170)
+            if hasattr(widget, "setMinimumContentsLength"):
+                widget.setMinimumContentsLength(10)
+            if hasattr(widget, "setSizeAdjustPolicy") and hasattr(QtWidgets.QComboBox, "SizeAdjustPolicy"):
+                widget.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
 
         controls = QtWidgets.QToolBox(self)
 
@@ -958,6 +1130,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         pick_form = QtWidgets.QFormLayout(page_pick)
         pick_form.setContentsMargins(6, 6, 6, 6)
         pick_form.addRow("Auto pick mode", self.cmb_auto_mode)
+        pick_form.addRow("Click mode", self.cmb_click_mode)
         pick_form.addRow(self.btn_v2_settings)
         pick_form.addRow("Hilbert target", self.cmb_hilbert_target)
         pick_form.addRow("HILBERT_ONSET_PCT", self.spin_hilbert_onset_pct)
@@ -995,7 +1168,7 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.control_dock.setWidget(controls)
         self.control_dock.setFeatures(_dock_features("DockWidgetMovable", "DockWidgetFloatable"))
         self.control_dock.setMinimumWidth(180)
-        self.control_dock.setMaximumWidth(340)
+        self.control_dock.setMaximumWidth(300)
         self.addDockWidget(_dock_area_left(), self.control_dock)
 
         self.shot_list = QtWidgets.QListWidget(self)
@@ -1077,10 +1250,12 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.spin_f3.valueChanged.connect(self._on_view_settings_changed)
         self.spin_f4.valueChanged.connect(self._on_view_settings_changed)
         self.cmb_auto_mode.currentTextChanged.connect(self._on_view_settings_changed)
+        self.cmb_click_mode.currentTextChanged.connect(self._on_view_settings_changed)
         self.cmb_hilbert_target.currentTextChanged.connect(self._on_view_settings_changed)
         self.spin_hilbert_onset_pct.valueChanged.connect(self._on_view_settings_changed)
         self.cmb_pick_order.currentTextChanged.connect(self._on_view_settings_changed)
         self.spin_manual_snap.valueChanged.connect(self._on_view_settings_changed)
+        self.spin_max_neg_jump.valueChanged.connect(self._on_view_settings_changed)
         self.display.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.display.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self.display.canvas.mpl_connect("button_release_event", self._on_canvas_release)
@@ -1097,6 +1272,9 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         act_open_project = QAction("Open Project...", self)
         act_open_project.triggered.connect(self._open_project_dialog)
         menu_file.addAction(act_open_project)
+
+        self.menu_recent = menu_file.addMenu("Open Recent Project")
+        self._rebuild_recent_menu()
 
         act_project_settings = QAction("Project Settings...", self)
         act_project_settings.triggered.connect(lambda: self._edit_project_settings_dialog())
@@ -1199,7 +1377,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         self.settings.f2 = float(self.spin_f2.value())
         self.settings.f3 = float(self.spin_f3.value())
         self.settings.f4 = float(self.spin_f4.value())
-        self.settings.auto_pick_mode = self.cmb_auto_mode.currentText().strip().lower()
+        self.settings.auto_pick_mode = (self.cmb_auto_mode.currentData() or "hilbert_env")
+        self.settings.pick_interaction_mode = (self.cmb_click_mode.currentData() or "auto")
         self.settings.hilbert_target = self.cmb_hilbert_target.currentText().strip().lower()
         self.settings.hilbert_onset_pct = float(self.spin_hilbert_onset_pct.value())
         self.settings.pick_order = self.cmb_pick_order.currentText().strip().upper()
@@ -1525,6 +1704,10 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         return fil
 
     def _snap_pick_time_ms(self, shot: ShotGather, trace_idx: int, click_t_ms: float) -> float:
+        # Manual click mode: drop the pick exactly where the user clicked,
+        # regardless of the auto-pick method selected.
+        if str(self.settings.pick_interaction_mode).lower() == "manual":
+            return float(click_t_ms)
         mode = str(self.settings.auto_pick_mode).lower()
         dt_s = shot.dt_ms / 1000.0
         t0 = self._time_zero_ms(shot)
@@ -1582,7 +1765,23 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
     def _auto_gate_local_s(self, i: int, rp: np.ndarray, shot_pos: float,
                            t0: float, dt_s: float, n_samp: int) -> tuple[float, float]:
         """Velocity-gated search window (seconds from sample 0), like the script."""
-        vmin, vmax, pad = 120.0, 3500.0, 20.0
+        mode = str(self.settings.auto_pick_mode).lower()
+        if mode == "picker_v2":
+            gate_cfg = self._v2_settings
+            if getattr(gate_cfg, "use_velocity_gate", True):
+                vmin = float(getattr(gate_cfg, "vmin_m_s", AUTO_VMIN_M_S))
+                vmax = float(getattr(gate_cfg, "vmax_m_s", AUTO_VMAX_M_S))
+                pad = float(getattr(gate_cfg, "gate_pad_ms", AUTO_GATE_PAD_MS))
+            else:
+                t_lo_view = float(self.settings.t_min_ms)
+                t_hi_view = float(self.settings.t_max_ms)
+                a = max(0.0, (t_lo_view - t0) / 1000.0)
+                b = min((n_samp - 1) * dt_s, (t_hi_view - t0) / 1000.0)
+                if b <= a:
+                    a, b = 0.0, (n_samp - 1) * dt_s
+                return a, b
+        else:
+            vmin, vmax, pad = AUTO_VMIN_M_S, AUTO_VMAX_M_S, AUTO_GATE_PAD_MS
         t_lo_view = float(self.settings.t_min_ms)
         t_hi_view = float(self.settings.t_max_ms)
         off = abs(float(rp[i]) - float(shot_pos)) if i < len(rp) else 0.0
@@ -1596,6 +1795,83 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
             a, b = 0.0, (n_samp - 1) * dt_s
         return a, b
 
+    def _refine_v2_pick_time_ms(
+        self,
+        trace_samples: np.ndarray,
+        dt_s: float,
+        sub_start_sample: int,
+        gate_abs_s: tuple[float, float],
+        result: Any,
+    ) -> float | None:
+        if result is None or result.sample is None:
+            return None
+
+        rel_sample = int(result.sample)
+        peak_abs_s = float((sub_start_sample + rel_sample) * dt_s)
+        gate_start_abs_s, gate_end_abs_s = gate_abs_s
+        rel_gate_start_s = max(0.0, gate_start_abs_s - sub_start_sample * dt_s)
+        rel_gate_end_s = min((len(trace_samples) - 1) * dt_s, gate_end_abs_s - sub_start_sample * dt_s)
+        if rel_gate_end_s <= rel_gate_start_s:
+            rel_gate_start_s, rel_gate_end_s = 0.0, (len(trace_samples) - 1) * dt_s
+
+        search_back_s = min(0.015, max(0.006, peak_abs_s - gate_start_abs_s))
+        local_start_s = max(rel_gate_start_s, rel_sample * dt_s - search_back_s)
+        local_end_s = min(rel_gate_end_s, rel_sample * dt_s + 2.0 * dt_s)
+        if local_end_s <= local_start_s:
+            local_start_s = rel_gate_start_s
+            local_end_s = min(rel_gate_end_s, rel_sample * dt_s + 2.0 * dt_s)
+
+        candidates_abs_s: list[float] = []
+
+        prob = np.asarray(getattr(result, "arrival_probability", None), dtype=float)
+        if prob.size:
+            gate0 = max(0, int(np.floor(rel_gate_start_s / dt_s)))
+            peak0 = max(gate0 + 1, rel_sample)
+            base_seg = prob[gate0:peak0]
+            peak_val = float(prob[min(rel_sample, prob.size - 1)])
+            base_val = float(np.median(base_seg)) if base_seg.size else 0.0
+            thr = base_val + 0.22 * max(0.0, peak_val - base_val)
+            for j in range(min(rel_sample, prob.size - 1), max(gate0 + 1, 1), -1):
+                if prob[j] >= thr and prob[j - 1] < thr:
+                    y0 = float(prob[j - 1])
+                    y1 = float(prob[j])
+                    frac = 0.0 if abs(y1 - y0) < 1e-12 else (thr - y0) / (y1 - y0)
+                    candidates_abs_s.append((sub_start_sample + (j - 1 + frac)) * dt_s)
+                    break
+
+        tro = Trace(data=np.asarray(trace_samples, dtype=np.float32))
+        tro.stats.delta = float(dt_s)
+        noise_start_s = max(0.0, rel_gate_start_s - 0.25 * max(dt_s, rel_gate_end_s - rel_gate_start_s))
+        _env, _peak_s, hilbert_onset_s = hilbert_envelope_pick(
+            trace=tro,
+            win_start_s=local_start_s,
+            win_end_s=local_end_s,
+            onset_pct=float(self._v2_settings.hilbert_onset_pct),
+            noise_window_s=(noise_start_s, rel_gate_start_s),
+        )
+        if hilbert_onset_s is not None:
+            candidates_abs_s.append((sub_start_sample * dt_s) + float(hilbert_onset_s))
+
+        zero_s = _zero_crossing_from_extremum_samples(
+            samples=np.asarray(trace_samples, dtype=float),
+            dt_s=dt_s,
+            win_start_s=local_start_s,
+            win_end_s=local_end_s,
+            search_direction="backward",
+            use_abs_peak=True,
+        )
+        if zero_s is not None:
+            candidates_abs_s.append((sub_start_sample * dt_s) + float(zero_s))
+
+        valid = [
+            float(ts) for ts in candidates_abs_s
+            if np.isfinite(ts) and gate_start_abs_s <= float(ts) <= gate_end_abs_s
+        ]
+        if not valid:
+            return peak_abs_s
+        valid.sort()
+        return valid[len(valid) // 2]
+
     def _auto_pick_current_shot(self):
         if self.current_idx < 0 or self.current_idx >= len(self.shots):
             return
@@ -1606,70 +1882,188 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
         t0 = self._time_zero_ms(shot)
         mode = str(self.settings.auto_pick_mode).lower()
         picks = self._shot_pick_map(self.current_idx)
+        picks.clear()
         rp = self._receiver_positions_for_shot(shot)
         shot_pos = self._shot_geom_position(shot, rp)
         count = 0
-        rejected = 0
+        adjusted = 0
 
         max_neg_jump = float(self.settings.max_negative_jump_ms)
         _last_valid_ms: list = [None]
 
         def _accept(trace_idx: int, ms: float) -> bool:
             """Accept a candidate pick unless it jumps more than
-            `max_neg_jump` ms earlier than the previous trace's accepted
-            pick (traces processed in index order). Real first-break
-            travel time should not decrease much from one trace to the
-            next; a big drop almost always means the auto-picker latched
-            onto noise or an unrelated event on that one trace.
+            `max_neg_jump` ms earlier than the previous (already-accepted,
+            moving outward from the shot) trace's pick. Must be called
+            while iterating `trace_order` below, NOT plain trace index
+            order - real first-break travel time increases with distance
+            FROM the shot in each direction, not with trace index, so for
+            any middle/backward shot the naive "previous trace index" -
+            comparison sees the correct moveout as one big decrease
+            followed by an increase (a V-shape) and would reject almost
+            everything on one side.
             """
-            nonlocal rejected
+            nonlocal adjusted
+            if not np.isfinite(ms):
+                return False
             prev = _last_valid_ms[0]
             if prev is not None and (prev - ms) > max_neg_jump:
-                rejected += 1
-                return False
+                # Keep one pick per trace: enforce max allowed negative
+                # jump by clamping instead of dropping the trace pick.
+                ms = prev - max_neg_jump
+                adjusted += 1
             picks[trace_idx] = round(ms, 2)
             _last_valid_ms[0] = ms
             return True
 
+        def _fallback_pick_ms(trace_idx: int, a: float, b: float) -> float:
+            """Always return a physically plausible fallback inside gate.
+
+            Order:
+            1) first significant onset (noise-referenced)
+            2) zero-crossing backtracked from strongest extremum
+            3) gate-start time (last resort, never leave trace unpicked)
+            """
+            tr = prepared[trace_idx].astype(float)
+            noise_a = max(0.0, a - 0.3 * max(0.0, b - a))
+            zt = first_significant_extremum_zero_crossing(
+                samples=tr,
+                dt_s=dt_s,
+                win_start_s=a,
+                win_end_s=b,
+                threshold_ratio=0.25,
+                noise_win_start_s=noise_a,
+                noise_win_end_s=a,
+                search_direction="backward",
+            )
+            if zt is None:
+                zt = _zero_crossing_from_extremum_samples(
+                    samples=tr,
+                    dt_s=dt_s,
+                    win_start_s=a,
+                    win_end_s=b,
+                    search_direction="backward",
+                    use_abs_peak=True,
+                )
+            if zt is None:
+                zt = float(a)
+            return float(t0 + float(zt) * 1000.0)
+
+        def _shot_outward_order(n_traces: int, center_idx: int) -> list:
+            """Trace indices ordered outward from the shot's own trace,
+            as two independent monotonic-outward passes (increasing
+            offset each way) with a `None` sentinel between them so
+            `_accept`'s running comparison resets for the second side
+            instead of comparing across the shot position.
+            """
+            center_idx = max(0, min(n_traces - 1, center_idx))
+            order: list = list(range(center_idx, n_traces))
+            order.append(None)
+            order += list(range(center_idx - 1, -1, -1))
+            return order
+
+        shot_trace_idx = int(np.argmin(np.abs(rp - shot_pos))) if len(rp) else 0
+        trace_order = _shot_outward_order(prepared.shape[0], shot_trace_idx)
+
         if mode == "picker_v2":
-            raw_data = np.asarray(shot.data, dtype=np.float64)
+            # Feed the SAME filtered+gained matrix the other auto-pickers
+            # use (not the raw, noisy trace), and crop every trace to the
+            # shared velocity-gated window. This is the key fix for V2
+            # both (a) picking worse than plain Hilbert - on the full
+            # untrimmed trace the fused likelihood peak often lands on a
+            # later, louder reverberation instead of the true first break -
+            # and (b) hanging ("not responding") on short profiles, because
+            # the cross-correlation alignment and per-sample feature stack
+            # were running over all ~4800 samples of every trace instead of
+            # the few hundred around the actual arrival.
+            gate = [self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
+                    for i in range(prepared.shape[0])]
+            k0 = max(0, int(min(a for a, _ in gate) / dt_s))
+            k1 = min(n_samp, int(max(b for _, b in gate) / dt_s) + 1)
+            if k1 - k0 < 16:
+                k0, k1 = 0, n_samp
+            sub = np.asarray(prepared[:, k0:k1], dtype=np.float64)
             offsets_m = [float(rp[i]) - float(shot_pos) if i < len(rp) else 0.0
-                        for i in range(raw_data.shape[0])]
+                        for i in range(sub.shape[0])]
             v2_settings = self._v2_settings
             v2_picker = FirstBreakPickerV2(settings=v2_settings)
             try:
-                v2_results = v2_picker.pick_profile(raw_data, dt_s, offsets_m=offsets_m)
+                # do_preprocess=False: `prepared` is already filtered+gained,
+                # so re-filtering inside V2 would double-process it.
+                v2_results = v2_picker.pick_profile(
+                    sub, dt_s, offsets_m=offsets_m, do_preprocess=False
+                )
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(self, "Auto Pick (Picker V2)", f"Failed: {exc}")
                 v2_results = []
+
+            candidate_ms: dict[int, float] = {}
             low_conf = 0
             for i, r in enumerate(v2_results):
+                a, b = gate[i]
                 if r.sample is None:
+                    candidate_ms[i] = _fallback_pick_ms(i, a, b)
                     continue
-                picks[i] = round(t0 + float(r.sample) * shot.dt_ms, 2)
-                count += 1
+
+                refined_abs_s = self._refine_v2_pick_time_ms(
+                    trace_samples=np.asarray(sub[i], dtype=np.float32),
+                    dt_s=dt_s,
+                    sub_start_sample=k0,
+                    gate_abs_s=(float(a), float(b)),
+                    result=r,
+                )
+                if refined_abs_s is None:
+                    candidate_ms[i] = _fallback_pick_ms(i, a, b)
+                else:
+                    candidate_ms[i] = float(t0 + float(refined_abs_s) * 1000.0)
+
                 if r.confidence is not None and r.confidence < v2_settings.minimum_confidence:
                     low_conf += 1
+
+            # Ensure we still pick every trace if V2 returned fewer rows.
+            for i in range(prepared.shape[0]):
+                if i in candidate_ms:
+                    continue
+                a, b = gate[i]
+                candidate_ms[i] = _fallback_pick_ms(i, a, b)
+
+            for i in trace_order:
+                if i is None:
+                    _last_valid_ms[0] = None
+                    continue
+                if _accept(i, candidate_ms[i]):
+                    count += 1
+
             self._last_pick_method = "Picker Engine V2 (auto, per-shot)"
             self.statusBar().showMessage(
                 f"Auto-pick (Picker V2 - features>likelihood>coherence>optimize>confidence): "
                 f"{count}/{shot.n_traces} placed"
+                + (f", {adjusted} jump-adjusted" if adjusted else "")
                 + (f", {low_conf} flagged low-confidence (review before trusting)" if low_conf else "")
             )
             self._render_current()
             return
 
         if mode == "stalta":
-            n_sta = max(1, int(0.003 / dt_s))
-            n_lta = max(3, int(0.020 / dt_s))
-            trig = 3.0
-            for i in range(prepared.shape[0]):
+            n_sta = max(1, int((STA_MS / 1000.0) / dt_s))
+            n_lta = max(3, int((LTA_MS / 1000.0) / dt_s))
+            trig = float(STALTA_TRIG)
+            for i in trace_order:
+                if i is None:
+                    _last_valid_ms[0] = None
+                    continue
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
                 lo_k = max(n_lta, int(a / dt_s))
                 hi_k = min(n_samp - n_sta - 1, int(b / dt_s))
                 tr = prepared[i].astype(float)
                 tr = tr - np.mean(tr[: max(1, n_lta)])
-                char = np.maximum(tr, 0.0)
+                # Squared amplitude (energy), not half-wave rectification -
+                # np.maximum(tr, 0.0) was silently discarding every
+                # negative-polarity sample, i.e. blind to half the signal.
+                # A real arrival whose strongest early motion is negative
+                # (common, depending on source/receiver polarity) would
+                # never trigger STA/LTA at all under the old version.
+                char = tr ** 2
                 found = None
                 for k in range(lo_k, max(lo_k + 1, hi_k)):
                     lta = char[k - n_lta:k].mean()
@@ -1679,25 +2073,40 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                     if sta / lta >= trig:
                         found = k
                         break
-                if found is not None:
-                    if _accept(i, t0 + found * shot.dt_ms):
-                        count += 1
+                ms = (t0 + found * shot.dt_ms) if found is not None else _fallback_pick_ms(i, a, b)
+                if _accept(i, ms):
+                    count += 1
         elif mode == "maxdiff_zero":
-            for i in range(prepared.shape[0]):
+            for i in trace_order:
+                if i is None:
+                    _last_valid_ms[0] = None
+                    continue
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
-                zt = _zero_crossing_from_extremum_samples(
+                # First significant onset above the pre-shot noise floor,
+                # not the single loudest sample in the (often very wide,
+                # velocity-gated) window - the old version was effectively
+                # a "loudest event finder", which in real data usually
+                # means a later reverberation cycle beats the true, often
+                # smaller, first-arrival onset.
+                noise_a = max(0.0, a - 0.3 * (b - a))
+                zt = first_significant_extremum_zero_crossing(
                     samples=prepared[i].astype(float),
                     dt_s=dt_s,
                     win_start_s=a,
                     win_end_s=b,
+                    threshold_ratio=0.25,
+                    noise_win_start_s=noise_a,
+                    noise_win_end_s=a,
                     search_direction="backward",
-                    use_abs_peak=True,
                 )
-                if zt is not None:
-                    if _accept(i, t0 + zt * 1000.0):
-                        count += 1
+                ms = (t0 + zt * 1000.0) if zt is not None else _fallback_pick_ms(i, a, b)
+                if _accept(i, ms):
+                    count += 1
         else:
-            for i in range(prepared.shape[0]):
+            for i in trace_order:
+                if i is None:
+                    _last_valid_ms[0] = None
+                    continue
                 a, b = self._auto_gate_local_s(i, rp, shot_pos, t0, dt_s, n_samp)
                 tr = Trace(data=np.asarray(prepared[i], dtype=np.float32))
                 tr.stats.delta = float(dt_s)
@@ -1711,13 +2120,13 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                     ts = peak_s if peak_s is not None else onset_s
                 else:
                     ts = onset_s if onset_s is not None else peak_s
-                if ts is not None:
-                    if _accept(i, t0 + float(ts) * 1000.0):
-                        count += 1
+                ms = (t0 + float(ts) * 1000.0) if ts is not None else _fallback_pick_ms(i, a, b)
+                if _accept(i, ms):
+                    count += 1
 
         self.statusBar().showMessage(
             f"Auto-pick ({mode}): {count}/{shot.n_traces} placed"
-            + (f", {rejected} rejected (>{max_neg_jump:.0f}ms earlier than previous trace)" if rejected else "")
+            + (f", {adjusted} jump-adjusted (clamped to {max_neg_jump:.0f}ms max earlier than previous trace)" if adjusted else "")
         )
         self._render_current()
 
@@ -2202,16 +2611,25 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 any(self.picks_by_shot.get(i) for i in range(len(self.shots))) or self._last_analysis
             )
             if has_unsaved_work:
-                choice = QtWidgets.QMessageBox.question(
-                    self, "Switch Profile",
+                sb = QtWidgets.QMessageBox.StandardButton
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle("Switch Profile")
+                box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+                box.setText(
                     f"Switch away from profile '{old_profile or '(unknown)'}'?\n\n"
-                    "Current picks (and any computed layer analysis) will be "
-                    "auto-saved first, so nothing is lost.",
-                    QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                    "You have picks (and possibly a computed layer analysis) that "
+                    "are not saved to this profile's output yet."
                 )
-                if choice != QtWidgets.QMessageBox.StandardButton.Ok:
+                box.setStandardButtons(sb.Save | sb.Discard | sb.Cancel)
+                box.setDefaultButton(sb.Save)
+                box.button(sb.Save).setText("Save && Switch")
+                box.button(sb.Discard).setText("Don't Save")
+                choice = box.exec()
+                if choice == sb.Cancel:
                     return
-                self._autosave_current_work()
+                if choice == sb.Save:
+                    self._autosave_current_work()
+                # Discard: switch without saving.
 
         self._current_folder = Path(folder)
         try:
@@ -2605,6 +3023,21 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 for idx in range(len(self.shots))
             }
 
+            # Acquisition date/time + midpoint XYZ from the middle shot's
+            # SEG2 header (preferred over the coordinate Excel value).
+            acq_dt_de = None
+            seg2_mid_xyz = None
+            if self.shots:
+                mid_shot = self.shots[len(self.shots) // 2]
+                try:
+                    acq_dt_de = read_seg2_acquisition_time_de(mid_shot.source_file)
+                except Exception:
+                    acq_dt_de = None
+                try:
+                    seg2_mid_xyz = read_seg2_mid_xyz(mid_shot.source_file)
+                except Exception:
+                    seg2_mid_xyz = None
+
             result = export_full_analysis(
                 profile_name=a["profile"],
                 cfg=a["cfg"],
@@ -2622,6 +3055,8 @@ class LvlStudioWindow(QtWidgets.QMainWindow):
                 raw_folder=project.raw_folder,
                 po_sources=a.get("po_sources"),
                 picker_method=getattr(self, "_last_pick_method", "Interactive (manual)"),
+                acquisition_time_de=acq_dt_de,
+                seg2_mid_xyz=seg2_mid_xyz,
                 finalize=True,
                 raw_shots=raw_shots,
                 qc_display_mode=self.settings.display_mode,
